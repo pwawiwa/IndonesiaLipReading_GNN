@@ -1,8 +1,0 @@
-pyproject.toml
-src/config.py
-src/preprocess.py
-src/lipreading_gnn.egg-info/PKG-INFO
-src/lipreading_gnn.egg-info/SOURCES.txt
-src/lipreading_gnn.egg-info/dependency_links.txt
-src/lipreading_gnn.egg-info/requires.txt
-src/lipreading_gnn.egg-info/top_level.txt

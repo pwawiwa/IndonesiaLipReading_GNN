@@ -1,0 +1,2 @@
+dataset_root: "data/IDLRW-DATASET"   # root dataset asli
+landmark_root: "data/landmarks"      # root hasil ekstraksi landmarks
