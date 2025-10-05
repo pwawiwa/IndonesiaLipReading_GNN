@@ -13,7 +13,7 @@ from utils_video import load_video_frames
 mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
 mp_styles = mp.solutions.drawing_styles
-
+    
 
 def extract_landmarks_from_video(video_path, out_path, max_frames=30, preview=False):
     cap = cv2.VideoCapture(video_path)

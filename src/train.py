@@ -28,7 +28,6 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
         correct += (preds == batch.y).sum().item()
         total += batch.num_graphs
 
-        # bisa dimatiin kalau spam
         pbar.set_postfix(loss=loss.item())
 
     avg_loss = total_loss / total
@@ -74,7 +73,10 @@ def main():
         train_ds = train_ds[:args.subset]
         val_ds = val_ds[:args.subset]
 
-    num_classes = len(train_ds.classes)
+    # === ambil jumlah kelas dari dataset ===
+    all_labels = [d.y.item() for d in train_ds]
+    num_classes = int(max(all_labels) + 1)
+    print("Num classes detected:", num_classes)
 
     train_loader = DataLoader(train_ds, batch_size=4, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=4)
