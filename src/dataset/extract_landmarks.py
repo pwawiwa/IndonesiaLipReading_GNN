@@ -7,15 +7,18 @@ from tqdm import tqdm
 import yaml
 import cv2
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from utils_video import load_video_frames
+# sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# from utils_video import load_video_frames
 
 mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
 mp_styles = mp.solutions.drawing_styles
     
 
-def extract_landmarks_from_video(video_path, out_path, max_frames=30, preview=False):
+def extract_landmarks_from_video(video_path, out_path, max_frames=40, preview=False, mouth_only=True):
+    # MediaPipe FaceMesh mouth landmark indices
+    MOUTH_LANDMARKS = [0, 13, 14, 17, 37, 39, 40, 61, 78, 80, 81, 82, 84, 87, 88, 91, 95, 146, 178, 181, 185, 191, 267, 269, 270, 291, 308, 310, 311, 312, 314, 317, 318, 321, 324, 375, 402, 405, 409, 415]
+    
     cap = cv2.VideoCapture(video_path)
     face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
@@ -44,7 +47,11 @@ def extract_landmarks_from_video(video_path, out_path, max_frames=30, preview=Fa
             if lm.shape[0] > 468:
                 lm = lm[:468, :]
 
-            landmarks_all.append(lm)  # (468, 3)
+            # Extract only mouth landmarks if requested
+            if mouth_only:
+                lm = lm[MOUTH_LANDMARKS, :]  # (40, 3)
+
+            landmarks_all.append(lm)  # (40, 3) if mouth_only, else (468, 3)
 
             if preview:
                 # draw only lips
@@ -71,15 +78,23 @@ def extract_landmarks_from_video(video_path, out_path, max_frames=30, preview=Fa
         print(f"[WARN] No landmarks found in {video_path}")
         return
 
-    landmarks_all = np.array(landmarks_all)  # (T, 468, 3)
+    landmarks_all = np.array(landmarks_all)  # (T, N, 3) where N=40 if mouth_only, else 468
 
     # --- Pad/truncate ---
     T = landmarks_all.shape[0]
+    N = landmarks_all.shape[1]  # Number of landmarks (40 or 468)
+    
     if T < max_frames:
-        pad = np.zeros((max_frames - T, 468, 3))
+        # Pad with zeros if video is shorter than max_frames
+        pad = np.zeros((max_frames - T, N, 3))
         landmarks_all = np.concatenate([landmarks_all, pad], axis=0)
-    else:
+        print(f"[PAD] Video has {T} frames, padding to {max_frames} frames")
+    elif T > max_frames:
+        # Truncate if video is longer than max_frames
         landmarks_all = landmarks_all[:max_frames]
+        print(f"[TRUNCATE] Video has {T} frames, truncating to {max_frames} frames")
+    else:
+        print(f"[OK] Video has exactly {T} frames")
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     np.savez_compressed(out_path, landmarks=landmarks_all)
@@ -90,8 +105,9 @@ def extract_landmarks_from_video(video_path, out_path, max_frames=30, preview=Fa
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--split", type=str, required=True, help="train/val/test")
-    parser.add_argument("--max_frames", type=int, default=30, help="max frames per video")
+    parser.add_argument("--max_frames", type=int, default=40, help="max frames per video")
     parser.add_argument("--preview", action="store_true", help="preview landmarks on video (lips only)")
+    parser.add_argument("--mouth-only", action="store_true", default=True, help="extract only mouth landmarks")
     args = parser.parse_args()
 
     # Load paths.yaml
@@ -117,7 +133,7 @@ def main():
         for vid in tqdm(videos, desc=f"{cls}-{split}"):
             vid_path = os.path.join(split_dir, vid)
             out_path = os.path.join(out_dir, vid.replace(".mp4", ".npz"))
-            extract_landmarks_from_video(vid_path, out_path, max_frames, preview=args.preview)
+            extract_landmarks_from_video(vid_path, out_path, max_frames, preview=args.preview, mouth_only=args.mouth_only)
 
 
 if __name__ == "__main__":

@@ -25,8 +25,8 @@ torch.serialization.add_safe_globals([
 # ]
 from gnn.facemesh_topology import get_facemesh_topology
 
-# load adjacency
-FACEMESH_ADJ, FACEMESH_CONNECTIONS = get_facemesh_topology()
+# load adjacency (mouth only by default)
+FACEMESH_ADJ, FACEMESH_CONNECTIONS = get_facemesh_topology(mouth_only=True)
 
 
 def get_class_names(landmark_root, split):
@@ -78,7 +78,7 @@ class LipReadingDataset(InMemoryDataset):
                     x = torch.tensor(landmarks.reshape(T * N, F), dtype=torch.float)
 
                     # build edge_index
-                    _, FACEMESH_CONNECTIONS = get_facemesh_topology()
+                    _, FACEMESH_CONNECTIONS = get_facemesh_topology(mouth_only=True)
                     edge_index = []
                     for t in range(T):
                         offset = t * N

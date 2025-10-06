@@ -1,0 +1,1 @@
+python src/dataset/preprocessing.py --function combine_to_pt_files --split train
