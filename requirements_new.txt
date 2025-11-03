@@ -1,0 +1,40 @@
+# Core dependencies
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+torch-geometric==2.6.1
+
+# Video and image processing
+opencv-python==4.12.0.88
+opencv-contrib-python==4.12.0.88
+mediapipe==0.10.14
+
+# Scientific computing
+numpy==1.26.4
+scipy==1.10.1
+
+# Machine learning utilities
+scikit-learn==1.7.2
+
+# Data manipulation and visualization
+pandas==2.3.2
+matplotlib==3.10.6
+seaborn==0.13.2
+
+# Progress bars and utilities
+tqdm==4.67.1
+
+# Development tools
+ipython>=8.12.0
+notebook>=7.0.0
+pytest>=7.3.1
+
+# Additional utilities for video processing
+av==16.0.0  # For video handling
+imageio==2.37.0  # For image I/O operations
+
+# Deep learning utilities
+tensorboard>=2.13.0
+
+# Project specific
+-e .
