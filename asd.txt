@@ -1,0 +1,9 @@
+python src/preprocessing.py \
+    --data_dir /Users/wirahutomo/Projects/TA_IDLR_GNN/data/IDLRW-DATASET \
+    --output_dir /Users/wirahutomo/Projects/TA_IDLR_GNN/data/processed \
+    --skip_processed
+
+python src/preprocessing.py \
+    --processed_dir /Users/wirahutomo/Projects/TA_IDLR_GNN/data/processed \
+    --output_dir /Users/wirahutomo/Projects/TA_IDLR_GNN/data/splits \
+    --create_splits
