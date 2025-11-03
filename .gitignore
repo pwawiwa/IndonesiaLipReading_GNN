@@ -47,3 +47,6 @@ logs/
 *.zip
 *.tar.gz
 *.rar
+
+# Local reversible archive created during cleanup
+cleanup_archive/
