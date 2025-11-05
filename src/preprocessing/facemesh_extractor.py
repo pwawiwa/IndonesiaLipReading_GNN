@@ -8,15 +8,12 @@ import torch
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"        # hides TensorFlow/MediaPipe C++ logs
-os.environ["GLOG_minloglevel"] = "3"            # hides Google logging (I/W/F)
-os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"       # optional: disable GPU to silence GL init spam
 
 # ---------- Single-file facemesh extractor (safe for multiprocessing) ---------- #
 def process_video(video_path, fps=25):
     """Extract facemesh landmarks for a single video. Returns dict or None."""
     try:
+        # NOTE: The W0000 logs are from Mediapipe/TensorFlow internal logging and cannot be easily suppressed here.
         mp_face_mesh = mp.solutions.face_mesh
         face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1)
         cap = cv2.VideoCapture(str(video_path))
@@ -51,13 +48,14 @@ def process_video(video_path, fps=25):
         return {"video": Path(video_path).name, "landmarks": np.stack(frames_landmarks)}
     except Exception as e:
         # Returning None on failure; main process can log if needed
-        print(f"❌ Error processing {video_path}: {e}")
+        # NOTE: In parallel processing, too many prints here can slow down/crash the system.
+        # print(f"❌ Error processing {video_path}: {e}") 
         return None
 
 
 # ---------- Global Dataset Processor: aggregate all words into one split file ---------- #
 class GlobalDatasetProcessor:
-    def __init__(self, root_dir, output_root, fps=25, num_workers=4, save_every=200):
+    def __init__(self, root_dir, output_root, fps=25, num_workers=4, save_every=1000):
         """
         root_dir: data/IDLRW-DATASET
         output_root: '/Volumes/SSD/untitled folder'
@@ -93,6 +91,7 @@ class GlobalDatasetProcessor:
         # 🔁 Resume if possible
         if out_file.exists() and not force_restart:
             try:
+                # Assuming existing data is a list of dicts
                 existing = torch.load(out_file, weights_only=False)
                 results.extend(existing)
                 processed_names = {x["video"] for x in existing}
@@ -107,7 +106,7 @@ class GlobalDatasetProcessor:
             print(f"✅ Nothing to do for '{split}' — already complete.\n")
             return
 
-        # --- Global tqdm progress bar (only one output line) ---
+        # --- Main extraction loop with tqdm progress bar (RETAINED) ---
         progress = tqdm(total=len(to_process),
                         desc=f"Processing {split}",
                         ncols=100,
@@ -120,48 +119,13 @@ class GlobalDatasetProcessor:
                 completed = 0
 
                 for future in as_completed(futures):
+                    vp = futures[future]
                     data = None
                     try:
                         data = future.result()
                     except Exception:
-                        # silently skip errors, no spammy prints
+                        # Silently skip worker errors (they are handled in process_video or by the executor)
                         pass
-
-                    if data is not None:
-                        results.append(data)
-
-                    completed += 1
-                    progress.update(1)
-
-                    # 💾 intermediate save
-                    if completed % self.save_every == 0:
-                        torch.save(results, out_file)
-
-        except KeyboardInterrupt:
-            progress.close()
-            torch.save(results, out_file)
-            print(f"\n⏸️ Interrupted — progress saved to {out_file}")
-            raise
-        finally:
-            progress.close()
-
-        torch.save(results, out_file)
-        print(f"✅ Finished '{split}' → saved {len(results)} entries to {out_file}\n")
-
-        # --- Main extraction loop with tqdm progress bar ---
-        progress = tqdm(total=len(to_process), desc=f"Processing {split}", ncols=100, unit="video")
-        try:
-            with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-                futures = {executor.submit(process_video, str(vp), self.fps): vp for vp in to_process}
-                completed = 0
-
-                for future in as_completed(futures):
-                    vp = futures[future]
-                    try:
-                        data = future.result()
-                    except Exception as e:
-                        print(f"❌ Worker error ({vp.name}): {e}")
-                        data = None
 
                     if data is not None:
                         results.append(data)
@@ -176,50 +140,17 @@ class GlobalDatasetProcessor:
 
         except KeyboardInterrupt:
             progress.close()
+            # Save current progress before exiting
             torch.save(results, out_file)
-            print(f"\n⏸️ Interrupted — saved progress to {out_file}")
+            print(f"\n⏸️ Interrupted — progress saved to {out_file}. You can re-run to resume.")
             raise
         finally:
             progress.close()
 
         # ✅ Final save
         torch.save(results, out_file)
-        print(f"✅ Finished and saved {len(results)} entries to {out_file}\n")
-        # Parallel execution
-        try:
-            with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-                futures = {executor.submit(process_video, str(vp), self.fps): vp for vp in to_process}
-                i = 0
-                for future in as_completed(futures):
-                    vp = futures[future]
-                    i += 1
-                    try:
-                        data = future.result()
-                    except Exception as e:
-                        print(f"❌ Worker exception for {vp}: {e}")
-                        data = None
+        print(f"✅ Finished '{split}' → saved {len(results)} entries to {out_file}\n")
 
-                    if data is not None:
-                        results.append(data)
-
-                    # Incremental save
-                    if i % self.save_every == 0:
-                        torch.save(results, out_file)
-                        print(f"💾 Saved intermediate {out_file} after {i} processed in this run.")
-
-                    # optional live progress print
-                    if i % 50 == 0:
-                        print(f"Processed {i}/{len(to_process)} in this run...")
-
-        except KeyboardInterrupt:
-            # Save current progress before exiting
-            torch.save(results, out_file)
-            print(f"\n⏸️ Interrupted — saved progress to {out_file}. You can re-run to resume.")
-            raise
-
-        # Final save
-        torch.save(results, out_file)
-        print(f"✅ Finished and saved {len(results)} entries to {out_file}")
 
     def run_all(self, force_restart=False):
         for split in ["train", "val", "test"]:
@@ -230,8 +161,11 @@ class GlobalDatasetProcessor:
 def main():
     root_dir = Path("data/IDLRW-DATASET")
     output_root = Path("data/processed_all")
+    # Setting workers to half of available cores is a good default for CPU-heavy tasks
     num_workers = max(1, (os.cpu_count() or 2) // 2)
-    processor = GlobalDatasetProcessor(root_dir, output_root, fps=25, num_workers=num_workers, save_every=200)
+    
+    # Using 10000 based on your observation that less frequent saves increases speed
+    processor = GlobalDatasetProcessor(root_dir, output_root, fps=25, num_workers=num_workers, save_every=10000)
 
     # If you want to force a full restart (ignore/resume), set force_restart=True
     force_restart = False
