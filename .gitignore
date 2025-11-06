@@ -26,9 +26,10 @@ data/landmarks/train/
 data/landmarks/test/
 data/landmarks/val/
 data/preprocessed/
-data/processed_all
+data/processed
 data/graphs
 data/features
+data
 
 # Model checkpoints and weights
 *.pth

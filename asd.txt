@@ -7,3 +7,6 @@ python src/preprocessing.py \
     --processed_dir /Users/wirahutomo/Projects/TA_IDLR_GNN/data/processed \
     --output_dir /Users/wirahutomo/Projects/TA_IDLR_GNN/data/splits \
     --create_splits
+
+
+python src/train.py --model_file base_gnn.py --epochs 10 --save_path data/models/base_gnn.pt
