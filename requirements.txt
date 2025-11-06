@@ -1,42 +1,17 @@
-## Indonesia Lip Reading GNN - curated requirements
-
-# Core PyTorch and Graph libraries
-torch==2.8.0
-torchvision==0.23.0
-torchaudio==2.8.0
-torch-geometric==2.6.1
-
-# Video and image processing
-opencv-python==4.12.0.88
-opencv-contrib-python==4.12.0.88
-mediapipe==0.10.14
-av==16.0.0
-
-# Scientific computing
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+torch-geometric==2.5.0
 numpy==1.26.4
-scipy==1.10.1
-
-# Machine learning utilities
-scikit-learn==1.7.2
-scikit-image==0.25.2
-
-# Data manipulation and visualization
-pandas==2.3.2
-matplotlib==3.10.6
+scipy==1.13.1
+pandas==2.2.2
+opencv-python==4.9.0.80
+mediapipe==0.10.14
+scikit-learn==1.5.0
+xgboost==2.0.3
+matplotlib==3.9.0
 seaborn==0.13.2
-
-# Progress bars and utilities
-tqdm==4.67.1
-
-# Development and debugging
-tensorboard>=2.13.0
-ipython>=8.12.0
-notebook>=7.0.0
-pytest>=7.3.1
-
-# Optional but useful
-imageio==2.37.0
-requests==2.32.5
-
-# Install project in editable mode
--e .
+tqdm==4.66.2
+py-feat==0.5.1
+h5py==3.11.0
+joblib==1.4.2
