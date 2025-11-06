@@ -19,6 +19,8 @@ idlrw-env/
 .DS_Store
 Thumbs.db
 
+.python-version
+install-pyenv-win.ps1
 # Dataset and processed data
 data/IDLRW-DATASET/
 data/landmarks/processed/
