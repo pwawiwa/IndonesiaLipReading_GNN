@@ -23,10 +23,6 @@ Thumbs.db
 install-pyenv-win.ps1
 # Dataset and processed data
 data/IDLRW-DATASET/
-data/landmarks/processed/
-data/landmarks/train/
-data/landmarks/test/
-data/landmarks/val/
 data/preprocessed/
 data/processed
 data/graphs
