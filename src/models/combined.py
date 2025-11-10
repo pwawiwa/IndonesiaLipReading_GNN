@@ -18,6 +18,7 @@ class SpatioTemporalGNN(nn.Module):
     """
     Combined Spatial-Temporal Graph Neural Network
     Processes both spatial (graph) and temporal (sequence) information
+    Now supports speech mask for focusing on relevant frames
     """
     
     def __init__(
@@ -30,7 +31,8 @@ class SpatioTemporalGNN(nn.Module):
         temporal_layers: int = 2,
         dropout: float = 0.3,
         use_gat: bool = False,
-        temporal_type: str = 'lstm'  # 'lstm' or 'attention'
+        temporal_type: str = 'lstm',  # 'lstm' or 'attention'
+        use_speech_mask: bool = True  # NEW: Use speech mask if available
     ):
         """
         Args:
@@ -43,12 +45,14 @@ class SpatioTemporalGNN(nn.Module):
             dropout: Dropout rate
             use_gat: Use GAT instead of GCN
             temporal_type: Type of temporal model ('lstm' or 'attention')
+            use_speech_mask: Whether to apply speech mask weighting
         """
         super(SpatioTemporalGNN, self).__init__()
         
         self.input_dim = input_dim
         self.num_classes = num_classes
         self.temporal_type = temporal_type
+        self.use_speech_mask = use_speech_mask
         
         # Spatial GCN
         self.spatial_gcn = SpatialGCN(

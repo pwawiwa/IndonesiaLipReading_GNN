@@ -1,0 +1,76 @@
+{
+    "worst_cases": [
+        {
+            "video_id": "ada_03098",
+            "true_label": 0,
+            "pred_label": 89,
+            "confidence": 0.01740926504135132,
+            "is_correct": false
+        },
+        {
+            "video_id": "dulu_00345",
+            "true_label": 20,
+            "pred_label": 89,
+            "confidence": 0.017408860847353935,
+            "is_correct": false
+        },
+        {
+            "video_id": "hari_00423",
+            "true_label": 27,
+            "pred_label": 89,
+            "confidence": 0.017407573759555817,
+            "is_correct": false
+        },
+        {
+            "video_id": "kita_02336",
+            "true_label": 41,
+            "pred_label": 89,
+            "confidence": 0.017407532781362534,
+            "is_correct": false
+        },
+        {
+            "video_id": "sampai_00413",
+            "true_label": 76,
+            "pred_label": 89,
+            "confidence": 0.017407387495040894,
+            "is_correct": false
+        }
+    ],
+    "best_cases": [
+        {
+            "video_id": "suka_00040",
+            "true_label": 89,
+            "pred_label": 89,
+            "confidence": 0.01732585020363331,
+            "is_correct": true
+        },
+        {
+            "video_id": "suka_00161",
+            "true_label": 89,
+            "pred_label": 89,
+            "confidence": 0.01724882423877716,
+            "is_correct": true
+        },
+        {
+            "video_id": "suka_00013",
+            "true_label": 89,
+            "pred_label": 89,
+            "confidence": 0.01692308858036995,
+            "is_correct": true
+        },
+        {
+            "video_id": "suka_00080",
+            "true_label": 89,
+            "pred_label": 89,
+            "confidence": 0.01671227253973484,
+            "is_correct": true
+        },
+        {
+            "video_id": "saya_01315",
+            "true_label": 77,
+            "pred_label": 77,
+            "confidence": 0.016460077837109566,
+            "is_correct": true
+        }
+    ]
+}

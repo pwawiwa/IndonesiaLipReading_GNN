@@ -9,6 +9,7 @@ __pycache__/
 venv/
 idlrw-env/
 
+data
 # IDE/editor settings
 .vscode/
 .idea/

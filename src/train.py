@@ -172,6 +172,13 @@ class Trainer:
         self.best_val_loss = float('inf')
         self.best_epoch = 0
         
+        # Mixed precision training for faster GPU training
+        self.use_amp = device.type == 'cuda'
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        
+        if self.use_amp:
+            logger.info("Using mixed precision training (AMP)")
+        
         logger.info(f"Trainer initialized. Outputs will be saved to {self.run_dir}")
     
     def _create_weighted_loss(self, train_loader) -> nn.Module:
@@ -221,19 +228,35 @@ class Trainer:
         for i, batch in enumerate(pbar):
             batch = batch.to(self.device)
             
-            # Forward pass
-            logits = self.model(batch)
-            loss = self.criterion(logits, batch.y.squeeze(-1))
-            loss = loss / accumulation_steps  # Scale loss
-            
-            # Backward pass
-            loss.backward()
-            
-            # Update weights every accumulation_steps
-            if (i + 1) % accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+            # Mixed precision training
+            if self.use_amp:
+                with torch.amp.autocast('cuda'):
+                    logits = self.model(batch)
+                    loss = self.criterion(logits, batch.y.squeeze(-1))
+                    loss = loss / accumulation_steps
+                
+                # Backward with gradient scaling
+                self.scaler.scale(loss).backward()
+                
+                # Update weights
+                if (i + 1) % accumulation_steps == 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
+            else:
+                # Standard training
+                logits = self.model(batch)
+                loss = self.criterion(logits, batch.y.squeeze(-1))
+                loss = loss / accumulation_steps
+                
+                loss.backward()
+                
+                if (i + 1) % accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
             
             # Statistics
             total_loss += loss.item() * accumulation_steps * batch.num_graphs
@@ -249,8 +272,14 @@ class Trainer:
         
         # Final update if there are remaining gradients
         if (i + 1) % accumulation_steps != 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            if self.use_amp:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
             self.optimizer.zero_grad()
         
         metrics = {
@@ -262,12 +291,44 @@ class Trainer:
     
     def validate(self) -> Dict:
         """Validate on validation set"""
-        metrics = self.evaluator.evaluate(
-            self.model,
-            self.val_loader,
-            self.device,
-            self.criterion
-        )
+        self.model.eval()
+        
+        total_loss = 0.0
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            pbar = tqdm(self.val_loader, desc="Validating", leave=False)
+            for batch in pbar:
+                batch = batch.to(self.device)
+                
+                # Forward pass with AMP if enabled
+                if self.use_amp:
+                    with torch.amp.autocast('cuda'):
+                        logits = self.model(batch)
+                        loss = self.criterion(logits, batch.y.squeeze(-1))
+                else:
+                    logits = self.model(batch)
+                    loss = self.criterion(logits, batch.y.squeeze(-1))
+                
+                # Statistics
+                total_loss += loss.item() * batch.num_graphs
+                preds = torch.argmax(logits, dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(batch.y.cpu().numpy())
+        
+        # Calculate metrics
+        all_preds = np.array(all_preds)
+        all_labels = np.array(all_labels)
+        
+        from sklearn.metrics import accuracy_score, f1_score
+        
+        metrics = {
+            'loss': total_loss / len(self.val_loader.dataset),
+            'accuracy': accuracy_score(all_labels, all_preds),
+            'f1_macro': f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        }
+        
         return metrics
     
     def train(self):
@@ -279,49 +340,57 @@ class Trainer:
         for epoch in range(1, self.num_epochs + 1):
             logger.info(f"\nEpoch {epoch}/{self.num_epochs}")
             
-            # Train
-            train_metrics = self.train_epoch()
-            
-            # Validate
-            val_metrics = self.validate()
-            
-            # Update history
-            self.history['train_loss'].append(train_metrics['loss'])
-            self.history['train_acc'].append(train_metrics['accuracy'])
-            self.history['val_loss'].append(val_metrics['loss'])
-            self.history['val_acc'].append(val_metrics['accuracy'])
-            self.history['val_f1'].append(val_metrics['f1_macro'])
-            self.history['learning_rate'].append(self.optimizer.param_groups[0]['lr'])
-            
-            # Log metrics
-            logger.info(
-                f"Train Loss: {train_metrics['loss']:.4f} | "
-                f"Train Acc: {train_metrics['accuracy']:.4f}"
-            )
-            logger.info(
-                f"Val Loss: {val_metrics['loss']:.4f} | "
-                f"Val Acc: {val_metrics['accuracy']:.4f} | "
-                f"Val F1: {val_metrics['f1_macro']:.4f}"
-            )
-            
-            # Learning rate scheduling
-            old_lr = self.optimizer.param_groups[0]['lr']
-            self.scheduler.step(epoch + val_metrics['loss'] / 100)  # Cosine annealing
-            self.plateau_scheduler.step(val_metrics['loss'])  # Plateau reduction
-            new_lr = self.optimizer.param_groups[0]['lr']
-            if abs(old_lr - new_lr) > 1e-8:
-                logger.info(f"Learning rate: {old_lr:.6f} → {new_lr:.6f}")
-            
-            # Save best model
-            if val_metrics['loss'] < self.best_val_loss:
-                self.best_val_loss = val_metrics['loss']
-                self.best_epoch = epoch
-                self.save_checkpoint('best_model.pth', epoch, val_metrics)
-                logger.info(f"✓ New best model saved (Val Loss: {val_metrics['loss']:.4f})")
-            
-            # Early stopping
-            if self.early_stopping(val_metrics['loss']):
-                logger.info(f"Early stopping at epoch {epoch}")
+            try:
+                # Train
+                train_metrics = self.train_epoch()
+                
+                # Validate
+                logger.info("Running validation...")
+                val_metrics = self.validate()
+                
+                # Update history
+                self.history['train_loss'].append(train_metrics['loss'])
+                self.history['train_acc'].append(train_metrics['accuracy'])
+                self.history['val_loss'].append(val_metrics['loss'])
+                self.history['val_acc'].append(val_metrics['accuracy'])
+                self.history['val_f1'].append(val_metrics['f1_macro'])
+                self.history['learning_rate'].append(self.optimizer.param_groups[0]['lr'])
+                
+                # Log metrics
+                logger.info(
+                    f"Train Loss: {train_metrics['loss']:.4f} | "
+                    f"Train Acc: {train_metrics['accuracy']:.4f}"
+                )
+                logger.info(
+                    f"Val Loss: {val_metrics['loss']:.4f} | "
+                    f"Val Acc: {val_metrics['accuracy']:.4f} | "
+                    f"Val F1: {val_metrics['f1_macro']:.4f}"
+                )
+                
+                # Learning rate scheduling
+                old_lr = self.optimizer.param_groups[0]['lr']
+                self.scheduler.step(epoch + val_metrics['loss'] / 100)  # Cosine annealing
+                self.plateau_scheduler.step(val_metrics['loss'])  # Plateau reduction
+                new_lr = self.optimizer.param_groups[0]['lr']
+                if abs(old_lr - new_lr) > 1e-8:
+                    logger.info(f"Learning rate: {old_lr:.6f} → {new_lr:.6f}")
+                
+                # Save best model
+                if val_metrics['loss'] < self.best_val_loss:
+                    self.best_val_loss = val_metrics['loss']
+                    self.best_epoch = epoch
+                    self.save_checkpoint('best_model.pth', epoch, val_metrics)
+                    logger.info(f"✓ New best model saved (Val Loss: {val_metrics['loss']:.4f})")
+                
+                # Early stopping
+                if self.early_stopping(val_metrics['loss']):
+                    logger.info(f"Early stopping at epoch {epoch}")
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Error in epoch {epoch}: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 break
         
         # Save final model
@@ -527,13 +596,20 @@ def main():
     # Set random seeds
     torch.manual_seed(42)
     np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+        # Enable TF32 for better performance on RTX 4090
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Set cudnn benchmark for optimal performance
+        torch.backends.cudnn.benchmark = True
     
     # Configuration
     config = {
-        'data_dir': Path('data/processed'),
+        'data_dir': Path('data/processed_improved'),  # Use improved processed data
         'model_type': 'combined',  # 'spatial', 'temporal', or 'combined'
-        'batch_size': 32,  # Increased for better gradient estimates
-        'num_workers': 4,
+        'batch_size': 64,  # Increased for RTX 4090 (24GB VRAM)
+        'num_workers': 8,  # Increased for better CPU->GPU pipeline
         'learning_rate': 5e-4,  # Reduced for stability
         'weight_decay': 1e-3,  # Increased regularization
         'num_epochs': 100,
@@ -547,8 +623,18 @@ def main():
         'temporal_layers': 3,  # More layers
         'dropout': 0.5,  # Increased dropout
         'use_gat': False,
-        'temporal_type': 'lstm'  # 'lstm' or 'attention'
+        'temporal_type': 'lstm',  # 'lstm' or 'attention'
+        'use_speech_mask': True  # NEW: Use speech mask from improved extractor
     }
+    
+    device = torch.device(config['device'])
+    logger.info(f"Using device: {device}")
+    if torch.cuda.is_available():
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        logger.info(f"CUDA Version: {torch.version.cuda}")
+        logger.info(f"cuDNN Enabled: {torch.backends.cudnn.enabled}")
+        logger.info(f"TF32 Enabled: {torch.backends.cuda.matmul.allow_tf32}")
     
     logger.info("Configuration:")
     for k, v in config.items():

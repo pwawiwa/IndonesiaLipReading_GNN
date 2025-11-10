@@ -18,13 +18,16 @@ class LipReadingDataset(Dataset):
     Dataset class for loading .pt files and converting to PyG Data objects
     """
     
-    def __init__(self, pt_file_path: str, label_to_idx: Dict[str, int] = None):
+    def __init__(self, pt_file_path: str, label_to_idx: Dict[str, int] = None, 
+                 augment: bool = False):
         """
         Args:
             pt_file_path: Path to the .pt file
             label_to_idx: Dictionary mapping word labels to integer indices
+            augment: Whether to apply data augmentation
         """
         self.pt_file_path = Path(pt_file_path)
+        self.augment = augment
         
         # Load data
         logger.info(f"Loading dataset from {self.pt_file_path}")
@@ -62,6 +65,10 @@ class LipReadingDataset(Dataset):
         landmarks = sample['landmarks'].float()  # [T, N, 3]
         features = {k: v.float() for k, v in sample['features'].items()}
         
+        # Apply augmentation if enabled
+        if self.augment:
+            landmarks = self._augment_landmarks(landmarks)
+        
         T, N, _ = landmarks.shape  # T: time steps, N: nodes (landmarks)
         
         # Build edge index (static graph structure)
@@ -96,6 +103,20 @@ class LipReadingDataset(Dataset):
         label_str = sample['label']
         label_idx = self.label_to_idx[label_str]
         
+        # Get speech mask if available
+        speech_mask = sample.get('speech_mask', None)
+        if speech_mask is not None:
+            # Ensure it matches the temporal length
+            if len(speech_mask) != T:
+                # Pad or truncate to match
+                if len(speech_mask) < T:
+                    speech_mask = torch.cat([
+                        speech_mask,
+                        torch.zeros(T - len(speech_mask), dtype=speech_mask.dtype)
+                    ])
+                else:
+                    speech_mask = speech_mask[:T]
+        
         # Create PyG Data object
         # For temporal graphs, we'll use the first timestep as the main graph
         # and store the full temporal sequence
@@ -109,10 +130,40 @@ class LipReadingDataset(Dataset):
             acceleration=features.get('acceleration', None),  # [T-2, N, 3]
             edges_features=features.get('edges', None),  # [T, E_feat]
             num_frames=torch.tensor([T], dtype=torch.long),  # [1]
-            video_id=sample['video_id']
+            video_id=sample['video_id'],
+            # Speech-related info
+            speech_mask=speech_mask,  # [T] - 1.0 where word is spoken, 0.0 otherwise
+            metadata=sample.get('metadata', {})  # Original metadata
         )
         
         return data
+    
+    def _augment_landmarks(self, landmarks: torch.Tensor) -> torch.Tensor:
+        """
+        Apply random augmentation to landmarks
+        
+        Args:
+            landmarks: [T, N, 3] tensor
+            
+        Returns:
+            Augmented landmarks
+        """
+        # Random scaling (0.9 to 1.1)
+        if torch.rand(1).item() > 0.5:
+            scale = 0.9 + 0.2 * torch.rand(1).item()
+            landmarks = landmarks * scale
+        
+        # Random noise
+        if torch.rand(1).item() > 0.5:
+            noise = torch.randn_like(landmarks) * 0.01
+            landmarks = landmarks + noise
+        
+        # Random temporal shift (shift all frames slightly)
+        if torch.rand(1).item() > 0.5:
+            shift = torch.randn(1, 1, 3) * 0.02
+            landmarks = landmarks + shift
+        
+        return landmarks
     
     def _build_edge_index(self, num_nodes: int) -> torch.Tensor:
         """
@@ -175,20 +226,25 @@ def create_dataloaders(
     from torch_geometric.loader import DataLoader
     
     # Create datasets
-    train_dataset = LipReadingDataset(train_pt)
+    train_dataset = LipReadingDataset(train_pt, augment=True)
     label_mapping = train_dataset.get_label_mapping()
     num_classes = train_dataset.num_classes
     
-    val_dataset = LipReadingDataset(val_pt, label_to_idx=label_mapping)
-    test_dataset = LipReadingDataset(test_pt, label_to_idx=label_mapping)
+    val_dataset = LipReadingDataset(val_pt, label_to_idx=label_mapping, augment=False)
+    test_dataset = LipReadingDataset(test_pt, label_to_idx=label_mapping, augment=False)
     
     # Create dataloaders
+    # Determine if we should use pin_memory (only for CUDA, not MPS)
+    use_pin_memory = torch.cuda.is_available()
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=use_pin_memory,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     val_loader = DataLoader(
@@ -196,7 +252,9 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=use_pin_memory,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     test_loader = DataLoader(
@@ -204,7 +262,9 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=use_pin_memory,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     logger.info(f"Created dataloaders:")

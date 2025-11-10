@@ -1,0 +1,15 @@
+--- 🎬 Dataset Video Summary --- 
+
+**Total Files Scanned:** 5807
+**Successfully Processed Videos:** 5807
+**Processing Errors:** 0
+-----------------------------------
+### ⏱️ Total and Average Metrics
+  Total Dataset Duration: **4:08:41**
+  Total Dataset Size: **4.28 GB** (4381.43 MB)
+  Average Video Duration: 0:00:03
+  Average Video Size: 0.75 MB
+
+### 🖼️ Resolution Distribution
+  640x480: 5807 videos (100.0%)
+
