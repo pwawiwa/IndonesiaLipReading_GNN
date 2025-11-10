@@ -139,10 +139,7 @@ class Evaluator:
         
         # Confusion matrix
         metrics['confusion_matrix'] = confusion_matrix(labels, preds)
-        
-        # Top-k accuracy
-        metrics['top3_accuracy'] = self._topk_accuracy(logits, labels, k=3)
-        metrics['top5_accuracy'] = self._topk_accuracy(logits, labels, k=5)
+
         
         # Classification report (string)
         metrics['classification_report'] = classification_report(

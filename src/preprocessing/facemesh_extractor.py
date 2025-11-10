@@ -342,7 +342,7 @@ class FeatureEngineer:
         if velocity.shape[0] < 2:
             return np.zeros((0, velocity.shape[1], 3))
         return np.diff(velocity, axis=0)
-    
+        
     @staticmethod
     def compute_edge_features(landmarks: np.ndarray, edge_pairs: List[Tuple[int, int]]) -> np.ndarray:
         """
@@ -364,6 +364,7 @@ class FeatureEngineer:
 
 
 class FaceMeshExtractor:
+    #Extacat di 
     """Main extractor class for processing videos"""
     
     # Mouth region edge connections (anatomically meaningful)
@@ -465,7 +466,8 @@ class FaceMeshExtractor:
             
             # Compute features
             features = self._compute_all_features(landmarks_sequence)
-            
+            print(max(features[['velocity']])) # Debugging line
+
             # Convert to torch tensors with optional float16
             dtype = torch.float16 if self.config.use_float16 else torch.float32
             
