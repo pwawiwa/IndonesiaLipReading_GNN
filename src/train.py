@@ -1,647 +1,484 @@
 """
 src/train.py
-Main training script with comprehensive tracking and visualization
+Simple training script without early stopping
 """
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
-import logging
 import json
-from datetime import datetime
-from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import seaborn as sns
+from tqdm import tqdm
 import numpy as np
-from typing import Dict, List
+from sklearn.metrics import classification_report, accuracy_score, f1_score, precision_score, recall_score
+import logging
+from datetime import datetime
+from typing import Optional
 
-from dataset import create_dataloaders
-from models import create_model
-from eval import Evaluator
+from dataset.dataset import create_dataloaders
+from models.combined import CombinedModel
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
 
-class EarlyStopping:
-    """Early stopping to prevent overfitting"""
-    
-    def __init__(self, patience: int = 15, min_delta: float = 1e-4, mode: str = 'min'):
-        """
-        Args:
-            patience: Number of epochs to wait before stopping
-            min_delta: Minimum change to qualify as improvement
-            mode: 'min' or 'max'
-        """
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.counter = 0
-        self.best_value = None
-        self.early_stop = False
-        
-    def __call__(self, value: float) -> bool:
-        """
-        Check if should stop
-        
-        Args:
-            value: Current metric value
-            
-        Returns:
-            True if should stop
-        """
-        if self.best_value is None:
-            self.best_value = value
-            return False
-        
-        if self.mode == 'min':
-            improved = value < (self.best_value - self.min_delta)
-        else:
-            improved = value > (self.best_value + self.min_delta)
-        
-        if improved:
-            self.best_value = value
-            self.counter = 0
-        else:
-            self.counter += 1
-            
-        if self.counter >= self.patience:
-            self.early_stop = True
-            logger.info(f"Early stopping triggered after {self.counter} epochs without improvement")
-            return True
-        
-        return False
-
-
 class Trainer:
-    """Main training class"""
+    """Simple trainer"""
     
-    def __init__(
-        self,
-        model: nn.Module,
-        train_loader,
-        val_loader,
-        test_loader,
-        device: torch.device,
-        learning_rate: float = 1e-3,
-        weight_decay: float = 1e-4,
-        num_epochs: int = 100,
-        early_stopping_patience: int = 15,
-        model_name: str = "model",
-        save_dir: Path = Path("outputs")
-    ):
-        """
-        Args:
-            model: Model to train
-            train_loader: Training dataloader
-            val_loader: Validation dataloader
-            test_loader: Test dataloader
-            device: Device
-            learning_rate: Learning rate
-            weight_decay: Weight decay
-            num_epochs: Number of epochs
-            early_stopping_patience: Patience for early stopping
-            model_name: Name for saving
-            save_dir: Directory for outputs
-        """
+    def __init__(self, model, train_loader, val_loader, test_loader, 
+                 device, lr, num_epochs, save_dir, label_map, 
+                 checkpoint_interval: int = 10, resume: bool = False,
+                 resume_checkpoint: Optional[str] = None,
+                 epochs_per_run: Optional[int] = None,
+                 label_smoothing: float = 0.0):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
         self.device = device
         self.num_epochs = num_epochs
-        self.model_name = model_name
-        self.save_dir = save_dir
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.label_map = label_map
+        self.idx_to_label = {v: k for k, v in label_map.items()}
+        self.checkpoint_interval = max(1, int(checkpoint_interval))
+        self.checkpoint_dir = self.save_dir / 'checkpoints'
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.resume = resume
+        self.resume_checkpoint = resume_checkpoint
+        self.epochs_per_run = epochs_per_run
+        self.label_smoothing = label_smoothing
+        self.start_epoch = 1
         
-        # Create save directory with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_dir = self.save_dir / f"{model_name}_{timestamp}"
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        # Optimizer with good learning rate
+        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
         
-        # Optimizer and scheduler with warmup
-        self.optimizer = optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay,
-            betas=(0.9, 0.999)
+        # Scheduler
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=num_epochs, eta_min=lr/100
         )
         
-        # Warmup + Cosine Annealing
-        self.warmup_epochs = 5
-        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer,
-            T_0=10,  # Restart every 10 epochs
-            T_mult=2,
-            eta_min=learning_rate * 0.01
-        )
-        self.plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=8
-        )
+        # Loss
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
         
-        # Loss function with class weights for imbalanced data
-        self.criterion = self._create_weighted_loss(train_loader)
-        
-        # Early stopping
-        self.early_stopping = EarlyStopping(
-            patience=early_stopping_patience,
-            mode='min'
-        )
-        
-        # Evaluator
-        num_classes = train_loader.dataset.num_classes
-        class_names = list(train_loader.dataset.label_to_idx.keys())
-        self.evaluator = Evaluator(num_classes, class_names)
-        
-        # Training history
+        # History
         self.history = {
             'train_loss': [],
             'train_acc': [],
             'val_loss': [],
             'val_acc': [],
-            'val_f1': [],
-            'learning_rate': []
+            'val_f1': []
         }
         
-        self.best_val_loss = float('inf')
-        self.best_epoch = 0
-        
-        # Mixed precision training for faster GPU training
+        # Enable AMP for faster training
         self.use_amp = device.type == 'cuda'
         self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
-        
-        if self.use_amp:
-            logger.info("Using mixed precision training (AMP)")
-        
-        logger.info(f"Trainer initialized. Outputs will be saved to {self.run_dir}")
+
+        # Resume if requested
+        if self.resume:
+            self._resume_from_checkpoint(self.resume_checkpoint)
     
-    def _create_weighted_loss(self, train_loader) -> nn.Module:
-        """
-        Create weighted cross-entropy loss for imbalanced classes
-        
-        Args:
-            train_loader: Training dataloader
-            
-        Returns:
-            Weighted CrossEntropyLoss
-        """
-        logger.info("Computing class weights for imbalanced dataset...")
-        
-        # Count samples per class
-        class_counts = torch.zeros(train_loader.dataset.num_classes)
-        for data in train_loader.dataset:
-            class_counts[data.y.item()] += 1
-        
-        # Compute weights: inverse of frequency
-        # Use effective number of samples for better weighting
-        beta = 0.9999
-        effective_num = 1.0 - torch.pow(beta, class_counts)
-        weights = (1.0 - beta) / (effective_num + 1e-8)
-        weights = weights / weights.sum() * len(weights)  # Normalize
-        
-        logger.info(f"Class weight statistics:")
-        logger.info(f"  Min weight: {weights.min():.4f}")
-        logger.info(f"  Max weight: {weights.max():.4f}")
-        logger.info(f"  Mean weight: {weights.mean():.4f}")
-        logger.info(f"  Samples per class - Min: {class_counts.min():.0f}, Max: {class_counts.max():.0f}")
-        
-        return nn.CrossEntropyLoss(weight=weights.to(self.device))
-        
-    def train_epoch(self) -> Dict:
-        """Train for one epoch"""
+    def train_epoch(self):
+        """Train one epoch"""
         self.model.train()
-        
-        total_loss = 0.0
+        total_loss = 0
         correct = 0
         total = 0
         
-        # Gradient accumulation
-        accumulation_steps = 2
-        
         pbar = tqdm(self.train_loader, desc="Training", leave=False)
-        for i, batch in enumerate(pbar):
+        for batch in pbar:
             batch = batch.to(self.device)
             
-            # Mixed precision training
+            self.optimizer.zero_grad()
+            
+            # Forward with AMP
             if self.use_amp:
-                with torch.amp.autocast('cuda'):
+                with torch.cuda.amp.autocast():
                     logits = self.model(batch)
-                    loss = self.criterion(logits, batch.y.squeeze(-1))
-                    loss = loss / accumulation_steps
+                    loss = self.criterion(logits, batch.y.squeeze())
                 
-                # Backward with gradient scaling
                 self.scaler.scale(loss).backward()
-                
-                # Update weights
-                if (i + 1) % accumulation_steps == 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.optimizer.zero_grad()
-            else:
-                # Standard training
-                logits = self.model(batch)
-                loss = self.criterion(logits, batch.y.squeeze(-1))
-                loss = loss / accumulation_steps
-                
-                loss.backward()
-                
-                if (i + 1) % accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-            
-            # Statistics
-            total_loss += loss.item() * accumulation_steps * batch.num_graphs
-            preds = torch.argmax(logits, dim=1)
-            correct += (preds == batch.y.squeeze(-1)).sum().item()
-            total += batch.num_graphs
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': loss.item() * accumulation_steps,
-                'acc': correct / total
-            })
-        
-        # Final update if there are remaining gradients
-        if (i + 1) % accumulation_steps != 0:
-            if self.use_amp:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                logits = self.model(batch)
+                loss = self.criterion(logits, batch.y.squeeze())
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
-            self.optimizer.zero_grad()
+            
+            # Stats
+            total_loss += loss.item() * batch.num_graphs
+            preds = logits.argmax(dim=1)
+            correct += (preds == batch.y.squeeze()).sum().item()
+            total += batch.num_graphs
+            
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}', 
+                'acc': f'{correct/total:.4f}'
+            })
         
-        metrics = {
-            'loss': total_loss / total,
-            'accuracy': correct / total
-        }
-        
-        return metrics
+        return total_loss / total, correct / total
     
-    def validate(self) -> Dict:
-        """Validate on validation set"""
+    def validate(self):
+        """Validate"""
         self.model.eval()
-        
-        total_loss = 0.0
+        total_loss = 0
+        correct = 0
+        total = 0
         all_preds = []
         all_labels = []
         
         with torch.no_grad():
-            pbar = tqdm(self.val_loader, desc="Validating", leave=False)
-            for batch in pbar:
+            for batch in tqdm(self.val_loader, desc="Validating", leave=False):
                 batch = batch.to(self.device)
                 
-                # Forward pass with AMP if enabled
                 if self.use_amp:
-                    with torch.amp.autocast('cuda'):
+                    with torch.cuda.amp.autocast():
                         logits = self.model(batch)
-                        loss = self.criterion(logits, batch.y.squeeze(-1))
+                        loss = self.criterion(logits, batch.y.squeeze())
                 else:
                     logits = self.model(batch)
-                    loss = self.criterion(logits, batch.y.squeeze(-1))
+                    loss = self.criterion(logits, batch.y.squeeze())
                 
-                # Statistics
                 total_loss += loss.item() * batch.num_graphs
-                preds = torch.argmax(logits, dim=1)
+                preds = logits.argmax(dim=1)
+                correct += (preds == batch.y.squeeze()).sum().item()
+                total += batch.num_graphs
+                
                 all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(batch.y.cpu().numpy())
+                all_labels.extend(batch.y.squeeze().cpu().numpy())
         
-        # Calculate metrics
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
+        # Calculate F1
+        f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
         
-        from sklearn.metrics import accuracy_score, f1_score
-        
-        metrics = {
-            'loss': total_loss / len(self.val_loader.dataset),
-            'accuracy': accuracy_score(all_labels, all_preds),
-            'f1_macro': f1_score(all_labels, all_preds, average='macro', zero_division=0)
-        }
-        
-        return metrics
+        return total_loss / total, correct / total, f1
     
-    def train(self):
-        """Main training loop"""
-        logger.info(f"Starting training for {self.num_epochs} epochs")
+    def train_all(self):
+        """Train for all epochs"""
+        logger.info(f"\n{'='*60}")
+        logger.info("TRAINING START")
+        logger.info(f"{'='*60}")
+        logger.info(f"Epochs: {self.num_epochs}")
         logger.info(f"Device: {self.device}")
-        logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters())}")
+        logger.info(f"Mixed Precision: {self.use_amp}")
+        logger.info(f"Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        logger.info(f"Train samples: {len(self.train_loader.dataset)}")
+        logger.info(f"Val samples: {len(self.val_loader.dataset)}")
+        logger.info(f"Classes: {len(self.label_map)}")
+        if self.resume and self.start_epoch > 1:
+            logger.info(f"Resuming from epoch {self.start_epoch}")
+        segment_msg = ""
+        run_end_epoch = self.num_epochs
+        if self.epochs_per_run is not None:
+            run_end_epoch = min(self.num_epochs, self.start_epoch + self.epochs_per_run - 1)
+            segment_msg = f"This run will cover epochs {self.start_epoch}-{run_end_epoch}."
+        logger.info(f"{'='*60}\n")
+        if segment_msg:
+            logger.info(segment_msg)
         
-        for epoch in range(1, self.num_epochs + 1):
+        best_val_acc = max(self.history['val_acc']) if self.history['val_acc'] else 0
+        best_val_f1 = max(self.history['val_f1']) if self.history['val_f1'] else 0
+        
+        for epoch in range(self.start_epoch, run_end_epoch + 1):
             logger.info(f"\nEpoch {epoch}/{self.num_epochs}")
+            logger.info(f"{'-'*60}")
             
-            try:
-                # Train
-                train_metrics = self.train_epoch()
-                
-                # Validate
-                logger.info("Running validation...")
-                val_metrics = self.validate()
-                
-                # Update history
-                self.history['train_loss'].append(train_metrics['loss'])
-                self.history['train_acc'].append(train_metrics['accuracy'])
-                self.history['val_loss'].append(val_metrics['loss'])
-                self.history['val_acc'].append(val_metrics['accuracy'])
-                self.history['val_f1'].append(val_metrics['f1_macro'])
-                self.history['learning_rate'].append(self.optimizer.param_groups[0]['lr'])
-                
-                # Log metrics
-                logger.info(
-                    f"Train Loss: {train_metrics['loss']:.4f} | "
-                    f"Train Acc: {train_metrics['accuracy']:.4f}"
-                )
-                logger.info(
-                    f"Val Loss: {val_metrics['loss']:.4f} | "
-                    f"Val Acc: {val_metrics['accuracy']:.4f} | "
-                    f"Val F1: {val_metrics['f1_macro']:.4f}"
-                )
-                
-                # Learning rate scheduling
-                old_lr = self.optimizer.param_groups[0]['lr']
-                self.scheduler.step(epoch + val_metrics['loss'] / 100)  # Cosine annealing
-                self.plateau_scheduler.step(val_metrics['loss'])  # Plateau reduction
-                new_lr = self.optimizer.param_groups[0]['lr']
-                if abs(old_lr - new_lr) > 1e-8:
-                    logger.info(f"Learning rate: {old_lr:.6f} → {new_lr:.6f}")
-                
-                # Save best model
-                if val_metrics['loss'] < self.best_val_loss:
-                    self.best_val_loss = val_metrics['loss']
-                    self.best_epoch = epoch
-                    self.save_checkpoint('best_model.pth', epoch, val_metrics)
-                    logger.info(f"✓ New best model saved (Val Loss: {val_metrics['loss']:.4f})")
-                
-                # Early stopping
-                if self.early_stopping(val_metrics['loss']):
-                    logger.info(f"Early stopping at epoch {epoch}")
-                    break
-                    
-            except Exception as e:
-                logger.error(f"Error in epoch {epoch}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                break
+            # Train
+            train_loss, train_acc = self.train_epoch()
+            
+            # Validate
+            val_loss, val_acc, val_f1 = self.validate()
+            
+            # Scheduler
+            self.scheduler.step()
+            lr = self.optimizer.param_groups[0]['lr']
+            
+            # Save history
+            self.history['train_loss'].append(train_loss)
+            self.history['train_acc'].append(train_acc)
+            self.history['val_loss'].append(val_loss)
+            self.history['val_acc'].append(val_acc)
+            self.history['val_f1'].append(val_f1)
+            
+            # Log
+            logger.info(f"Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
+            logger.info(f"Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
+            gen_gap = val_loss - train_loss
+            logger.info(f"LR: {lr:.6f} | Generalization Gap (val-train loss): {gen_gap:.4f}")
+            
+            # Track best
+            save_best = False
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_val_f1 = val_f1
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'val_acc': val_acc,
+                    'val_f1': val_f1,
+                }, self.save_dir / 'best_model.pth')
+                logger.info(f"✓ Saved best model (Acc: {val_acc:.4f}, F1: {val_f1:.4f})")
+                save_best = True
+
+            # Periodic checkpoints to allow resuming/analysis mid-training
+            should_checkpoint = (epoch % self.checkpoint_interval == 0) or save_best or (epoch == run_end_epoch)
+            if should_checkpoint:
+                self._save_checkpoint(epoch, is_best=save_best)
         
-        # Save final model
-        self.save_checkpoint('final_model.pth', epoch, val_metrics)
+        logger.info(f"\n{'='*60}")
+        if run_end_epoch >= self.num_epochs:
+            logger.info(f"TRAINING COMPLETE")
+            logger.info(f"{'='*60}")
+            logger.info(f"Best Val Acc: {best_val_acc:.4f}")
+            logger.info(f"Best Val F1: {best_val_f1:.4f}")
+            logger.info(f"{'='*60}\n")
+            
+            # Save final
+            torch.save({
+                'epoch': self.num_epochs,
+                'model_state_dict': self.model.state_dict(),
+                'history': self.history,
+            }, self.save_dir / 'final_model.pth')
+            
+            # Save final history and visualization
+            self._persist_history(self.save_dir / 'history.json')
+            self.plot_history()
+        else:
+            logger.info(f"SEGMENT COMPLETE (epochs {self.start_epoch}-{run_end_epoch}).")
+            logger.info("Resume training later to continue toward full 1000 epochs.")
         
-        # Save training history
-        self.save_history()
+        # Persist latest history regardless of completion
+        self._persist_history(self.save_dir / 'history.json')
+
+    def _persist_history(self, target_path: Path):
+        """Persist current training history to disk"""
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(target_path, 'w') as f:
+            json.dump(self.history, f, indent=2)
+
+    def _save_checkpoint(self, epoch: int, is_best: bool = False):
+        """
+        Save checkpoint with current training state.
         
-        # Plot training curves
-        self.plot_training_curves()
-        
-        logger.info(f"\nTraining completed!")
-        logger.info(f"Best model at epoch {self.best_epoch} with Val Loss: {self.best_val_loss:.4f}")
-        
-    def save_checkpoint(self, filename: str, epoch: int, metrics: Dict):
-        """Save model checkpoint"""
-        checkpoint = {
+        Args:
+            epoch: Current epoch number
+            is_best: Whether this checkpoint corresponds to a new best model
+        """
+        state = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
-            'metrics': metrics,
-            'history': self.history
+            'history': self.history,
+            'best_val_acc': max(self.history['val_acc']) if self.history['val_acc'] else 0.0,
+            'best_val_f1': max(self.history['val_f1']) if self.history['val_f1'] else 0.0,
         }
         
-        save_path = self.run_dir / filename
-        torch.save(checkpoint, save_path)
-        logger.info(f"Checkpoint saved to {save_path}")
+        checkpoint_path = self.checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pth'
+        torch.save(state, checkpoint_path)
+        torch.save(state, self.checkpoint_dir / 'latest_checkpoint.pth')
+        
+        if is_best:
+            torch.save(state, self.checkpoint_dir / 'best_checkpoint.pth')
+        
+        # Persist latest history & viz for progress reporting
+        self._persist_history(self.checkpoint_dir / 'history_latest.json')
+        self.plot_history(self.checkpoint_dir / 'training_curves_latest.png')
+        
+        logger.info(f"Saved checkpoint to {checkpoint_path}")
     
-    def save_history(self):
-        """Save training history"""
-        history_path = self.run_dir / "training_history.json"
-        with open(history_path, 'w') as f:
-            json.dump(self.history, f, indent=4)
-        logger.info(f"Training history saved to {history_path}")
+    def _resume_from_checkpoint(self, resume_checkpoint: Optional[str]):
+        """
+        Resume optimizer/model/history state from checkpoint.
+        """
+        ckpt_path = Path(resume_checkpoint) if resume_checkpoint else self.checkpoint_dir / 'latest_checkpoint.pth'
+        if not ckpt_path.exists():
+            logger.info(f"No checkpoint found at {ckpt_path}, starting fresh.")
+            return
+        
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        loaded_history = checkpoint.get('history', self.history)
+        # Ensure all keys exist
+        for key in self.history.keys():
+            loaded_history.setdefault(key, [])
+        self.history = loaded_history
+        
+        last_epoch = checkpoint.get('epoch', 0)
+        self.start_epoch = min(last_epoch + 1, self.num_epochs)
+        
+        logger.info(f"Resumed training from {ckpt_path} at epoch {self.start_epoch}")
     
-    def plot_training_curves(self):
-        """Plot and save training curves"""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    def plot_history(self, output_path: Optional[Path] = None):
+        """Plot training curves and optionally override output path"""
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         
         epochs = range(1, len(self.history['train_loss']) + 1)
         
         # Loss
-        axes[0, 0].plot(epochs, self.history['train_loss'], label='Train Loss', marker='o')
-        axes[0, 0].plot(epochs, self.history['val_loss'], label='Val Loss', marker='s')
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].set_title('Training and Validation Loss')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True)
+        axes[0].plot(epochs, self.history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+        axes[0].plot(epochs, self.history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+        axes[0].set_xlabel('Epoch', fontsize=12)
+        axes[0].set_ylabel('Loss', fontsize=12)
+        axes[0].set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+        axes[0].legend(fontsize=11)
+        axes[0].grid(True, alpha=0.3)
         
         # Accuracy
-        axes[0, 1].plot(epochs, self.history['train_acc'], label='Train Acc', marker='o')
-        axes[0, 1].plot(epochs, self.history['val_acc'], label='Val Acc', marker='s')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Accuracy')
-        axes[0, 1].set_title('Training and Validation Accuracy')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True)
+        axes[1].plot(epochs, self.history['train_acc'], 'b-', label='Train Acc', linewidth=2)
+        axes[1].plot(epochs, self.history['val_acc'], 'r-', label='Val Acc', linewidth=2)
+        axes[1].set_xlabel('Epoch', fontsize=12)
+        axes[1].set_ylabel('Accuracy', fontsize=12)
+        axes[1].set_title('Training and Validation Accuracy', fontsize=14, fontweight='bold')
+        axes[1].legend(fontsize=11)
+        axes[1].grid(True, alpha=0.3)
         
         # F1 Score
-        axes[1, 0].plot(epochs, self.history['val_f1'], label='Val F1 (Macro)', marker='s', color='green')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('F1 Score')
-        axes[1, 0].set_title('Validation F1 Score')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True)
-        
-        # Learning Rate
-        axes[1, 1].plot(epochs, self.history['learning_rate'], label='Learning Rate', marker='o', color='red')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Learning Rate')
-        axes[1, 1].set_title('Learning Rate Schedule')
-        axes[1, 1].set_yscale('log')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True)
+        axes[2].plot(epochs, self.history['val_f1'], 'g-', label='Val F1', linewidth=2)
+        axes[2].set_xlabel('Epoch', fontsize=12)
+        axes[2].set_ylabel('F1 Score', fontsize=12)
+        axes[2].set_title('Validation F1 Score', fontsize=14, fontweight='bold')
+        axes[2].legend(fontsize=11)
+        axes[2].grid(True, alpha=0.3)
         
         plt.tight_layout()
         
-        # Save plot
-        plot_path = self.run_dir / "training_curves.png"
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        logger.info(f"Training curves saved to {plot_path}")
+        # Save
+        if output_path is None:
+            viz_dir = Path('reports/viz')
+            viz_dir.mkdir(parents=True, exist_ok=True)
+            output_path = viz_dir / 'training_curves.png'
+        else:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        logger.info(f"Saved training curves to {output_path}")
         plt.close()
     
     def test(self):
-        """Test on test set"""
-        logger.info("\n" + "="*80)
-        logger.info("Testing on test set...")
-        logger.info("="*80)
+        """Test and generate report"""
+        logger.info(f"\n{'='*60}")
+        logger.info("TESTING")
+        logger.info(f"{'='*60}\n")
         
         # Load best model
-        best_model_path = self.run_dir / "best_model.pth"
-        checkpoint = torch.load(best_model_path)
+        checkpoint = torch.load(self.save_dir / 'best_model.pth')
         self.model.load_state_dict(checkpoint['model_state_dict'])
         logger.info(f"Loaded best model from epoch {checkpoint['epoch']}")
+        logger.info(f"Best Val Acc: {checkpoint['val_acc']:.4f}")
+        logger.info(f"Best Val F1: {checkpoint['val_f1']:.4f}\n")
         
-        # Evaluate
-        test_metrics = self.evaluator.evaluate(
-            self.model,
-            self.test_loader,
-            self.device,
-            self.criterion
+        self.model.eval()
+        
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch in tqdm(self.test_loader, desc="Testing"):
+                batch = batch.to(self.device)
+                
+                if self.use_amp:
+                    with torch.cuda.amp.autocast():
+                        logits = self.model(batch)
+                else:
+                    logits = self.model(batch)
+                
+                preds = logits.argmax(dim=1)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(batch.y.squeeze().cpu().numpy())
+        
+        # Metrics
+        acc = accuracy_score(all_labels, all_preds)
+        f1_macro = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        f1_weighted = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+        precision_macro = precision_score(all_labels, all_preds, average='macro', zero_division=0)
+        recall_macro = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+        
+        logger.info(f"Test Accuracy: {acc:.4f}")
+        logger.info(f"Test F1 (Macro): {f1_macro:.4f}")
+        logger.info(f"Test F1 (Weighted): {f1_weighted:.4f}")
+        
+        # Classification report
+        label_names = [self.idx_to_label[i] for i in range(len(self.label_map))]
+        report = classification_report(
+            all_labels, all_preds, 
+            target_names=label_names, 
+            digits=4,
+            zero_division=0
         )
         
-        # Print metrics
-        self.evaluator.print_metrics(test_metrics, title="Test Set Results")
+        # Save report
+        report_dir = Path('reports')
+        report_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save test metrics
-        metrics_path = self.run_dir / "test_metrics.json"
-        # Convert numpy arrays to lists for JSON serialization
-        test_metrics_serializable = {
-            k: v.tolist() if isinstance(v, np.ndarray) else v
-            for k, v in test_metrics.items()
-            if k not in ['classification_report', 'per_class']
-        }
-        with open(metrics_path, 'w') as f:
-            json.dump(test_metrics_serializable, f, indent=4)
-        logger.info(f"Test metrics saved to {metrics_path}")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_file = report_dir / f'classification_report_{timestamp}.txt'
         
-        # Plot confusion matrix
-        self.plot_confusion_matrix(test_metrics['confusion_matrix'])
+        with open(report_file, 'w') as f:
+            f.write("="*80 + "\n")
+            f.write("CLASSIFICATION REPORT\n")
+            f.write("="*80 + "\n\n")
+            f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Model: Combined Spatial-Temporal GNN\n")
+            f.write(f"Test Samples: {len(all_labels)}\n")
+            f.write(f"Num Classes: {len(self.label_map)}\n\n")
+            f.write(f"{'='*80}\n")
+            f.write(f"OVERALL METRICS\n")
+            f.write(f"{'='*80}\n\n")
+            f.write(f"Accuracy:              {acc:.4f}\n")
+            f.write(f"F1 Score (Macro):      {f1_macro:.4f}\n")
+            f.write(f"F1 Score (Weighted):   {f1_weighted:.4f}\n")
+            f.write(f"Precision (Macro):     {precision_macro:.4f}\n")
+            f.write(f"Recall (Macro):        {recall_macro:.4f}\n\n")
+            f.write(f"{'='*80}\n")
+            f.write(f"PER-CLASS METRICS\n")
+            f.write(f"{'='*80}\n\n")
+            f.write(report)
         
-        # Find worst and best cases
-        worst_cases, best_cases = self.evaluator.find_worst_and_best_cases(
-            self.model,
-            self.test_loader,
-            self.device,
-            top_k=5
-        )
+        logger.info(f"\nSaved report to {report_file}")
+        logger.info(f"\n{report}")
         
-        # Save cases
-        self.save_cases(worst_cases, best_cases)
-        
-        return test_metrics
-    
-    def plot_confusion_matrix(self, cm: np.ndarray):
-        """Plot and save confusion matrix"""
-        plt.figure(figsize=(12, 10))
-        
-        # Normalize confusion matrix
-        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-        
-        sns.heatmap(
-            cm_normalized,
-            annot=True,
-            fmt='.2f',
-            cmap='Blues',
-            xticklabels=self.evaluator.class_names,
-            yticklabels=self.evaluator.class_names
-        )
-        
-        plt.title('Normalized Confusion Matrix')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
-        plt.tight_layout()
-        
-        # Save plot
-        plot_path = self.run_dir / "confusion_matrix.png"
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        logger.info(f"Confusion matrix saved to {plot_path}")
-        plt.close()
-    
-    def save_cases(self, worst_cases: List, best_cases: List):
-        """Save worst and best cases"""
-        cases_path = self.run_dir / "cases_analysis.json"
-        
-        cases = {
-            'worst_cases': worst_cases,
-            'best_cases': best_cases
-        }
-        
-        with open(cases_path, 'w') as f:
-            json.dump(cases, f, indent=4)
-        
-        logger.info(f"Cases analysis saved to {cases_path}")
-        
-        # Print summary
-        logger.info("\n[Worst Cases - High Confidence Errors]")
-        for i, case in enumerate(worst_cases, 1):
-            true_label = self.evaluator.class_names[case['true_label']]
-            pred_label = self.evaluator.class_names[case['pred_label']]
-            logger.info(
-                f"{i}. {case['video_id']}: "
-                f"True={true_label}, Pred={pred_label}, "
-                f"Confidence={case['confidence']:.4f}"
-            )
-        
-        logger.info("\n[Best Cases - High Confidence Correct]")
-        for i, case in enumerate(best_cases, 1):
-            true_label = self.evaluator.class_names[case['true_label']]
-            logger.info(
-                f"{i}. {case['video_id']}: "
-                f"True={true_label}, "
-                f"Confidence={case['confidence']:.4f}"
-            )
+        return acc, f1_macro, f1_weighted
 
 
 def main():
-    """Main function"""
-    # Set random seeds
-    torch.manual_seed(42)
-    np.random.seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-        # Enable TF32 for better performance on RTX 4090
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        # Set cudnn benchmark for optimal performance
-        torch.backends.cudnn.benchmark = True
-    
-    # Configuration
+    # Config
     config = {
-        'data_dir': Path('data/processed_improved'),  # Use improved processed data
-        'model_type': 'combined',  # 'spatial', 'temporal', or 'combined'
-        'batch_size': 64,  # Increased for RTX 4090 (24GB VRAM)
-        'num_workers': 8,  # Increased for better CPU->GPU pipeline
-        'learning_rate': 5e-4,  # Reduced for stability
-        'weight_decay': 1e-3,  # Increased regularization
-        'num_epochs': 100,
-        'early_stopping_patience': 20,  # Increased patience
+        'data_dir': Path('data/processed'),
+        'batch_size': 64,  # Good for RTX 4090
+        'num_workers': 8,
+        'lr': 1e-3,  # Good learning rate
+        'num_epochs': 100,  # No early stopping
+        'spatial_dim': 256,
+        'temporal_dim': 512,
+        'spatial_layers': 3,
+        'temporal_layers': 2,
+        'dropout': 0.4,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        
-        # Model hyperparameters - Increased capacity for 100 classes
-        'spatial_hidden_dim': 256,  # Increased
-        'temporal_hidden_dim': 512,  # Increased
-        'spatial_layers': 4,  # More layers
-        'temporal_layers': 3,  # More layers
-        'dropout': 0.5,  # Increased dropout
-        'use_gat': False,
-        'temporal_type': 'lstm',  # 'lstm' or 'attention'
-        'use_speech_mask': True  # NEW: Use speech mask from improved extractor
+        'save_dir': 'outputs/combined',
+        'checkpoint_interval': 25,
     }
     
-    device = torch.device(config['device'])
-    logger.info(f"Using device: {device}")
-    if torch.cuda.is_available():
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
-        logger.info(f"CUDA Version: {torch.version.cuda}")
-        logger.info(f"cuDNN Enabled: {torch.backends.cudnn.enabled}")
-        logger.info(f"TF32 Enabled: {torch.backends.cuda.matmul.allow_tf32}")
-    
-    logger.info("Configuration:")
+    logger.info("\n" + "="*60)
+    logger.info("CONFIGURATION")
+    logger.info("="*60)
     for k, v in config.items():
-        logger.info(f"  {k}: {v}")
+        logger.info(f"{k:20s}: {v}")
+    logger.info("="*60)
     
-    # Create dataloaders
-    train_loader, val_loader, test_loader, label_mapping, num_classes = create_dataloaders(
+    # Load data
+    train_loader, val_loader, test_loader, num_classes, label_map = create_dataloaders(
         train_pt=str(config['data_dir'] / 'train.pt'),
         val_pt=str(config['data_dir'] / 'val.pt'),
         test_pt=str(config['data_dir'] / 'test.pt'),
@@ -649,49 +486,44 @@ def main():
         num_workers=config['num_workers']
     )
     
-    # Get input dimension from first batch
-    sample_batch = next(iter(train_loader))
-    input_dim = sample_batch.x.shape[1]
-    logger.info(f"Input dimension: {input_dim}")
-    logger.info(f"Number of classes: {num_classes}")
+    # Get input dim
+    sample = next(iter(train_loader))
+    input_dim = sample.x.shape[1]
+    
+    logger.info(f"\nData Info:")
+    logger.info(f"  Input dim: {input_dim}")
+    logger.info(f"  Num classes: {num_classes}")
+    logger.info(f"  Sample batch shape: {sample.x.shape}")
     
     # Create model
-    model = create_model(
-        model_type=config['model_type'],
+    model = CombinedModel(
         input_dim=input_dim,
         num_classes=num_classes,
-        spatial_hidden_dim=config['spatial_hidden_dim'],
-        temporal_hidden_dim=config['temporal_hidden_dim'],
+        spatial_dim=config['spatial_dim'],
+        temporal_dim=config['temporal_dim'],
         spatial_layers=config['spatial_layers'],
         temporal_layers=config['temporal_layers'],
-        dropout=config['dropout'],
-        use_gat=config['use_gat'],
-        temporal_type=config.get('temporal_type', 'lstm')
+        dropout=config['dropout']
     )
     
-    # Create trainer
+    # Train
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         test_loader=test_loader,
         device=torch.device(config['device']),
-        learning_rate=config['learning_rate'],
-        weight_decay=config['weight_decay'],
+        lr=config['lr'],
         num_epochs=config['num_epochs'],
-        early_stopping_patience=config['early_stopping_patience'],
-        model_name=config['model_type'],
-        save_dir=Path('outputs')
+        save_dir=config['save_dir'],
+        label_map=label_map,
+        checkpoint_interval=config['checkpoint_interval']
     )
     
-    # Train
-    trainer.train()
-    
-    # Test
+    trainer.train_all()
     trainer.test()
     
-    logger.info("\n✓ Training and evaluation completed!")
-    logger.info(f"Results saved to: {trainer.run_dir}")
+    logger.info("\n✅ ALL COMPLETE!")
 
 
 if __name__ == "__main__":

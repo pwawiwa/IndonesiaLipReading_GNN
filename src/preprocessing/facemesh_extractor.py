@@ -1,652 +1,518 @@
+"""
+facemesh_extractor.py
+Clean and simple FaceMesh extraction for lip reading
+Focus: Correct preprocessing, normalization, and features
+"""
 import os
+import re
 import cv2
 import mediapipe as mp
 import numpy as np
 import torch
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 import logging
 from tqdm import tqdm
-import concurrent.futures # <--- New import
+import concurrent.futures
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class FaceMeshConfig:
-    """Configuration for FaceMesh extraction"""
-    # MediaPipe settings
-    max_num_faces: int = 1
-    refine_landmarks: bool = True
-    min_detection_confidence: float = 0.5
-    min_tracking_confidence: float = 0.5
+class FaceMeshExtractor:
+    """Extract facial landmarks and features for lip reading"""
     
-    # ROI landmark indices (mouth-centric region)
-    roi_landmarks: List[int] = None
+    # Mouth-centric ROI: Complete articulation region
+    # Includes: lips (inner+outer), jaw, lower cheeks, nose reference
+    ROI_INDICES = [
+        # Nose reference (for normalization)
+        0, 1, 4,
+        # Upper lip outer
+        61, 185, 40, 39, 37, 267, 269, 270, 409, 291,
+        # Lower lip outer  
+        146, 91, 181, 84, 17, 314, 405, 321, 375,
+        # Upper lip inner
+        78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308,
+        # Lower lip inner
+        95, 88, 178, 87, 14, 317, 402, 318, 324,
+        # Jaw
+        152, 377, 400, 378, 379, 365, 397, 288, 435, 361, 323, 454, 356, 389,
+        # Cheeks (lower)
+        50, 101, 36, 280, 330, 266,
+    ]
     
-    # Normalization settings
-    target_fps: int = 25
-    use_float16: bool = True
+    # Remove duplicates and sort
+    ROI_INDICES = sorted(list(set(ROI_INDICES)))
     
-    # Feature engineering flags
-    compute_velocity: bool = True
-    compute_acceleration: bool = True
-    compute_geometric: bool = True
-    compute_edges: bool = True
-    compute_action_units: bool = True # <--- NEW FEATURE FLAG
+    # Edge connections (anatomical structure)
+    # We'll map these after ROI is defined
+    # Original MediaPipe indices that should be connected
+    EDGE_PAIRS_ORIGINAL = [
+        # Lips outer contour (complete loop)
+        (61, 185), (185, 40), (40, 39), (39, 37), (37, 0),
+        (0, 267), (267, 269), (269, 270), (270, 409), (409, 291),
+        (291, 375), (375, 321), (321, 405), (405, 314), (314, 17),
+        (17, 84), (84, 181), (181, 91), (91, 146), (146, 61),
+        
+        # Lips inner contour (complete loop)
+        (78, 191), (191, 80), (80, 81), (81, 82), (82, 13),
+        (13, 312), (312, 311), (311, 310), (310, 415), (415, 308),
+        (308, 324), (324, 318), (318, 402), (402, 317), (317, 14),
+        (14, 87), (87, 178), (178, 88), (88, 95), (95, 78),
+        
+        # Connect outer to inner
+        (61, 78), (291, 308), (13, 0), (14, 152),
+        
+        # Vertical connections (mouth opening)
+        (61, 13), (61, 14), (291, 13), (291, 14),
+        (0, 13), (0, 14),
+        
+        # Jaw connections
+        (152, 377), (377, 400), (400, 378), (378, 379), (379, 365),
+        (365, 397), (397, 288), (288, 435), (435, 361), (361, 323),
+        (323, 454), (454, 356), (356, 389), (389, 152),
+        
+        # Jaw to lips
+        (152, 14), (152, 17), (152, 0),
+        
+        # Cheeks to mouth
+        (50, 61), (50, 0), (101, 61), (36, 37),
+        (280, 291), (330, 291), (266, 267), (280, 0),
+        
+        # Nose anchors
+        (0, 1), (1, 4), (4, 0),
+    ]
     
-    # Parallelization setting (New)
-    num_workers: int = -1 # <--- New configuration option
-    
-    def __post_init__(self):
-        if self.roi_landmarks is None:
-            # Mouth-centric ROI: lips, inner mouth, jaw
-            self.roi_landmarks = [
-                0,  # Nose tip (reference point)
-                *range(11, 16),  # Right eye region (for alignment)
-                *range(37, 43),  # Mouth outer contour
-                *range(61, 81),  # Lips detailed
-                *range(87, 89),  # Chin points
-                13, 14, 17,  # Additional articulation points
-                61, 291, 308, 402, 78, 191  # Key mouth width/height points
-            ]
-            self.roi_landmarks = sorted(list(set(self.roi_landmarks)))
-
-
-class SpatialNormalizer:
-    """Handles spatial normalization of facial landmarks"""
-    
-    @staticmethod
-    def normalize_landmarks(
-        landmarks: np.ndarray,
-        nose_idx: int = 0,
-        left_eye_idx: int = 33,
-        right_eye_idx: int = 263,
-        mouth_left_idx: int = 61,
-        mouth_right_idx: int = 291
-    ) -> np.ndarray:
+    def __init__(self, num_workers: int = -1):
         """
-        Normalize landmarks to remove rotation, translation, scale
+        Args:
+            num_workers: Parallel workers (-1 = all CPUs)
+        """
+        self.num_workers = num_workers if num_workers > 0 else os.cpu_count()
+        self.mp_face_mesh = mp.solutions.face_mesh
+        
+        # Build edge index mapping
+        self.edge_index = self._build_edge_index()
+        self.edge_pairs = self.EDGE_PAIRS_ORIGINAL  # Store for later use
+        
+        logger.info(f"ROI: {len(self.ROI_INDICES)} landmarks")
+        logger.info(f"Edges: {len(self.edge_index[0])} connections")
+    
+    def _build_edge_index(self) -> np.ndarray:
+        """
+        Build edge index for ROI landmarks
+        Maps original landmark indices to ROI indices
+        
+        Returns:
+            [2, E] edge index where each edge is (src_roi_idx, dst_roi_idx)
+        """
+        # Create mapping from original index to ROI index
+        orig_to_roi = {orig_idx: roi_idx for roi_idx, orig_idx in enumerate(self.ROI_INDICES)}
+        
+        edges = []
+        
+        # Add anatomical edges
+        for src_orig, dst_orig in self.EDGE_PAIRS_ORIGINAL:
+            if src_orig in orig_to_roi and dst_orig in orig_to_roi:
+                src_roi = orig_to_roi[src_orig]
+                dst_roi = orig_to_roi[dst_orig]
+                # Add both directions (undirected graph)
+                edges.append([src_roi, dst_roi])
+                edges.append([dst_roi, src_roi])
+        
+        # Add k-NN connections for any unconnected nodes
+        # This ensures full connectivity
+        roi_size = len(self.ROI_INDICES)
+        k = 5
+        
+        for i in range(roi_size):
+            for j in range(max(0, i - k), min(roi_size, i + k + 1)):
+                if i != j:
+                    # Check if edge already exists
+                    if [i, j] not in edges and [j, i] not in edges:
+                        edges.append([i, j])
+                        edges.append([j, i])
+        
+        if not edges:
+            # Fallback: complete graph
+            for i in range(roi_size):
+                for j in range(i + 1, roi_size):
+                    edges.append([i, j])
+                    edges.append([j, i])
+        
+        return np.array(edges).T if edges else np.zeros((2, 0), dtype=int)
+    
+    def normalize_landmarks(self, landmarks: np.ndarray) -> np.ndarray:
+        """
+        Normalize landmarks to [0, 1] range
         
         Args:
-            landmarks: [N, 3] array of xyz coordinates
+            landmarks: [N, 3] raw landmarks (x, y, z in image coordinates)
             
         Returns:
-            Normalized landmarks in [-1, 1] range
+            [N, 3] normalized landmarks in [0, 1]
         """
-        if landmarks.shape[0] == 0:
-            return landmarks
-            
-        # 1. Center on nose tip
-        nose_point = landmarks[nose_idx].copy()
-        centered = landmarks - nose_point
+        # Method: Min-max normalization per dimension
+        normalized = landmarks.copy()
         
-        # 2. Calculate mouth width for scaling
-        if mouth_left_idx < landmarks.shape[0] and mouth_right_idx < landmarks.shape[0]:
-            mouth_width = np.linalg.norm(
-                landmarks[mouth_right_idx] - landmarks[mouth_left_idx]
-            )
-        else:
-            # Fallback: use all points spread
-            mouth_width = np.std(landmarks[:, :2]) * 2
+        for dim in range(3):
+            min_val = landmarks[:, dim].min()
+            max_val = landmarks[:, dim].max()
+            range_val = max_val - min_val
             
-        if mouth_width < 1e-6:
-            mouth_width = 1.0
-            
-        # 3. Scale by mouth width
-        scaled = centered / (mouth_width + 1e-8)
+            if range_val > 1e-6:
+                normalized[:, dim] = (landmarks[:, dim] - min_val) / range_val
+            else:
+                normalized[:, dim] = 0.5  # Center if no range
         
-        # 4. Rotate to align eye-line horizontal
-        if left_eye_idx < landmarks.shape[0] and right_eye_idx < landmarks.shape[0]:
-            left_eye = scaled[left_eye_idx, :2]
-            right_eye = scaled[right_eye_idx, :2]
-            
-            # Calculate rotation angle
-            eye_vector = right_eye - left_eye
-            angle = np.arctan2(eye_vector[1], eye_vector[0])
-            
-            # Rotation matrix (2D for x-y plane)
-            cos_a, sin_a = np.cos(-angle), np.sin(-angle)
-            rot_matrix = np.array([
-                [cos_a, -sin_a, 0],
-                [sin_a, cos_a, 0],
-                [0, 0, 1]
-            ])
-            
-            # Apply rotation
-            rotated = scaled @ rot_matrix.T
-        else:
-            rotated = scaled
-            
-        return rotated
-
-
-class FeatureEngineer:
-    """Extracts engineered features from normalized landmarks"""
+        return normalized
     
-    # Key landmark indices for AU estimation (MUST be full 468 indices)
-    # The code ASSUMES these indices are present in the landmarks array, 
-    # even though it receives the ROI subset. This is an existing flaw I cannot fix.
-    # We will use the full indices and rely on them being in the ROI list or handle the error.
-    # Note: 6, 9, 10, 15, 17, 18, 20, 23, 24, 25, 27 are NOT standard indices.
-    # We'll use the *full mesh indices* that correlate to the desired AUs:
-    AU_LANDMARKS = {
-        # Lower Face
-        'p13': 13, 'p14': 14, # Upper/Lower lip centers
-        'p61': 61, 'p291': 291, # Mouth corners (left/right)
-        'p17': 17, # Chin center (or nearest ROI point) - used for chin projection
-        'p152': 152, # Chin (jaw)
-        'p0': 0, # Nose Tip
-        # Mid Face (for AU6, AU9) - require points often excluded from a strict mouth ROI.
-        'p9': 9, # Nose Bridge/Nostril
-        'p37': 37, 'p267': 267, # Cheek/lower eye region (for AU6)
-    }
-
-    @staticmethod
-    def _safe_dist(landmarks: np.ndarray, idx1: int, idx2: int, default: float = 0.0) -> float:
-        """Utility to safely compute Euclidean distance"""
-        try:
-            # Check if indices are valid based on input array size
-            if idx1 < landmarks.shape[0] and idx2 < landmarks.shape[0]:
-                return np.linalg.norm(landmarks[idx1] - landmarks[idx2])
-        except IndexError:
-            # This handles the case where the full-mesh index is used on a subset array
-            # and is outside the bounds of the ROI array.
-            pass
-        return default
-
-    @staticmethod
-    def _safe_val(landmarks: np.ndarray, idx: int, dim: int, default: float = 0.0) -> float:
-        """Utility to safely get a coordinate value"""
-        try:
-            if idx < landmarks.shape[0]:
-                return landmarks[idx, dim]
-        except IndexError:
-            pass
-        return default
-
-    @staticmethod
-    def compute_action_units(landmarks: np.ndarray) -> Dict[str, float]:
+    def compute_action_units(self, landmarks: np.ndarray) -> np.ndarray:
         """
-        Estimate key Action Units (AUs) based on geometric features.
-        
-        Args:
-            landmarks: [N, 3] normalized ROI landmarks (N is ROI size)
-            
-        Returns:
-            Dictionary of estimated AU feature values (0-1 range, not official FACS intensity)
-        """
-        features = {}
-        # NOTE: Indices (like 13, 14, 61, 291) MUST be the indices *within the input array* (ROI subset)
-        # OR they must be the original 468 indices IF the input array IS the full 468.
-        # Since the input is the ROI subset, the hardcoded indices used in the original code
-        # (which I cannot change) are technically incorrect. I will use the **ROI array indices**
-        # for AU calculation where possible, assuming the relevant points are near the front.
-        
-        # --- Lower Face (Mouth/Lip Region) ---
-        
-        # AU12 - Lip Corner Puller (Smile)
-        # Ratio of mouth width to a fixed vertical reference (e.g., nose tip/chin span)
-        # The normalization step already scales by mouth width, so we track mouth corners vs the central axis.
-        # Let's use the distance between the corners (61, 291)
-        mouth_width = FeatureEngineer._safe_dist(landmarks, 61, 291) 
-        features['AU12'] = mouth_width # Higher distance = Higher AU12
-        
-        # AU26 - Jaw Drop / AU27 - Mouth Stretch (related to vertical opening)
-        # Vertical distance between upper and lower lip centers (13, 14)
-        mouth_height = FeatureEngineer._safe_dist(landmarks, 13, 14)
-        features['AU26'] = mouth_height # Higher distance = Higher AU26/27
-        
-        # AU25 - Lips Part (simple lips separation, often just mouth_height)
-        features['AU25'] = mouth_height 
-
-        # AU10 - Upper Lip Raiser (vertical movement of upper lip)
-        # Vertical distance from upper lip center (13) to nose tip (0)
-        upper_lip_y = FeatureEngineer._safe_val(landmarks, 13, 1)
-        nose_tip_y = FeatureEngineer._safe_val(landmarks, 0, 1)
-        features['AU10'] = nose_tip_y - upper_lip_y # Smaller distance (or larger delta) = Higher AU10
-
-        # AU15 - Lip Corner Depressor (frown)
-        # Y-position of mouth corners (61, 291) relative to a resting baseline (0)
-        corner_y_avg = (FeatureEngineer._safe_val(landmarks, 61, 1) + FeatureEngineer._safe_val(landmarks, 291, 1)) / 2
-        features['AU15'] = -corner_y_avg # Negative (down) movement = Higher AU15 (relative to 0, if 0 is nose-aligned)
-
-        # AU17 - Chin Raiser
-        # Distance between chin point (e.g., 152 in full mesh, or nearest ROI point) and lower lip (14)
-        # We will use the distance from a chin ROI point (e.g., 87, 88) to the lower lip (14)
-        chin_y = FeatureEngineer._safe_val(landmarks, 87, 1)
-        lower_lip_y = FeatureEngineer._safe_val(landmarks, 14, 1)
-        features['AU17'] = lower_lip_y - chin_y # Lower lip moving closer to chin = Higher AU17
-
-        # AU20 - Lip Stretcher (horizontal stretching)
-        # The primary measure is mouth width (AU12 is similar, but AU20 is pure horizontal)
-        features['AU20'] = mouth_width
-        
-        # AU18 - Lip Pucker / AU23 - Lip Tightener / AU24 - Lip Presser
-        # These are complex, often requiring z-depth (protrusion) and horizontal compression.
-        # We'll use Z-depth (protrusion) for a proxy of pucker/press.
-        # Mean Z-depth of the outer lip points relative to the nose tip (0)
-        upper_lip_z = FeatureEngineer._safe_val(landmarks, 13, 2)
-        nose_tip_z = FeatureEngineer._safe_val(landmarks, 0, 2)
-        features['AU18'] = upper_lip_z - nose_tip_z # Higher Z-depth (protrusion) = Higher AU18
-
-        # --- Mid Face (Articulation Support) ---
-        
-        # AU6 - Cheek Raiser (tightening)
-        # Vertical distance of cheek/lower eye region (e.g., 37, 267) to a horizontal reference (e.g., 61, 291)
-        # Since 37 is in the ROI, we'll use its Y-value relative to a stable point (0)
-        cheek_y = FeatureEngineer._safe_val(landmarks, 37, 1)
-        features['AU6'] = cheek_y - nose_tip_y # Cheek moving up = Higher AU6
-
-        # AU9 - Nose Wrinkler
-        # Vertical compression of the nose region (difficult with mouth-centric ROI)
-        # We'll use the Y-distance between nose tip (0) and a point higher up (e.g., 9, but 9 is not in ROI)
-        # We'll skip AU9 as the ROI doesn't contain sufficient upper-nose points.
-        features['AU9'] = 0.0 # Placeholder
-        
-        # Return only a clean array of features
-        au_vector = np.array([
-            features.get('AU6', 0.0),
-            features.get('AU9', 0.0),
-            features.get('AU10', 0.0),
-            features.get('AU12', 0.0),
-            features.get('AU15', 0.0),
-            features.get('AU17', 0.0),
-            features.get('AU18', 0.0),
-            features.get('AU20', 0.0),
-            features.get('AU23', 0.0), # Use AU18 proxy
-            features.get('AU24', 0.0), # Use AU18 proxy
-            features.get('AU25', 0.0),
-            features.get('AU26', 0.0),
-            features.get('AU27', 0.0) # Use AU26 proxy
-        ])
-        
-        return au_vector
-    
-    @staticmethod
-    def compute_geometric_features(landmarks: np.ndarray) -> Dict[str, float]:
-        """
-        Compute geometric features (distances, angles, areas)
+        Compute Action Units (FACS-based features for speech)
         
         Args:
             landmarks: [N, 3] normalized landmarks
             
         Returns:
-            Dictionary of geometric features
+            [18] AU values normalized to [0, 1]
         """
-        features = {}
+        def safe_dist(i, j):
+            """Euclidean distance between landmarks"""
+            if i < len(landmarks) and j < len(landmarks):
+                return float(np.linalg.norm(landmarks[i] - landmarks[j]))
+            return 0.0
         
-        # NOTE: Original code keeps this check, though it's flawed for ROI input.
-        if landmarks.shape[0] < 468:
-            # Added a temporary fix to prevent hard crash if the needed indices are outside the ROI bounds
-            # For geometric features, we rely on the original logic.
-            pass
-            
-        # Mouth height (vertical opening)
-        upper_lip_idx, lower_lip_idx = 13, 14
-        features['mouth_height'] = FeatureEngineer._safe_dist(landmarks, upper_lip_idx, lower_lip_idx)
+        def safe_coord(i, dim):
+            """Get coordinate value"""
+            if i < len(landmarks):
+                return float(landmarks[i, dim])
+            return 0.0
         
-        # Mouth width
-        left_corner_idx, right_corner_idx = 61, 291
-        features['mouth_width'] = FeatureEngineer._safe_dist(landmarks, left_corner_idx, right_corner_idx)
+        aus = []
         
-        # Jaw opening (chin to nose)
-        chin_idx, nose_idx = 152, 1
-        features['jaw_opening'] = FeatureEngineer._safe_dist(landmarks, chin_idx, nose_idx)
-
-        # Lip protrusion (nose tip to upper lip)
-        nose_tip_idx, upper_lip_center_idx = 0, 13
-        # Check if indices are valid before accessing z-coordinate
-        if nose_tip_idx < landmarks.shape[0] and upper_lip_center_idx < landmarks.shape[0]:
-            features['lip_protrusion'] = FeatureEngineer._safe_val(landmarks, upper_lip_center_idx, 2) - FeatureEngineer._safe_val(landmarks, nose_tip_idx, 2)
-        else:
-            features['lip_protrusion'] = 0.0
-
-        # Lip roundness (aspect ratio)
-        if features['mouth_width'] > 1e-6 and features['mouth_height'] > 1e-6:
-            features['lip_roundness'] = features['mouth_width'] / (features['mouth_height'] + 1e-8)
-        else:
-            features['lip_roundness'] = 0.0
+        # AU10: Upper Lip Raiser
+        aus.append(safe_coord(13, 1) - safe_coord(0, 1) if safe_coord(13, 1) < safe_coord(0, 1) else 0.0)
         
-        return features
+        # AU12: Lip Corner Puller (smile width)
+        aus.append(safe_dist(61, 291))
+        
+        # AU15: Lip Corner Depressor
+        corner_y = (safe_coord(61, 1) + safe_coord(291, 1)) / 2
+        aus.append(corner_y if corner_y > 0.5 else 0.0)
+        
+        # AU17: Chin Raiser
+        aus.append(safe_coord(14, 1) - safe_coord(152, 1) if safe_coord(14, 1) < safe_coord(152, 1) else 0.0)
+        
+        # AU18: Lip Pucker (protrusion)
+        aus.append(safe_coord(13, 2))
+        
+        # AU20: Lip Stretcher
+        aus.append(safe_dist(61, 291))
+        
+        # AU23: Lip Tightener
+        mouth_width = safe_dist(61, 291)
+        aus.append(1.0 - mouth_width if mouth_width < 1.0 else 0.0)
+        
+        # AU25: Lips Part
+        aus.append(safe_dist(13, 14))
+        
+        # AU26: Jaw Drop
+        aus.append(safe_dist(152, 0) if 152 < len(landmarks) else 0.0)
+        
+        # AU27: Mouth Stretch
+        aus.append(safe_dist(61, 291) * safe_dist(13, 14))
+        
+        # Pad to 18
+        aus.extend([0.0] * (18 - len(aus)))
+        
+        return np.clip(aus, 0, 1).astype(np.float32)
     
-    @staticmethod
-    def compute_velocity(landmarks_sequence: np.ndarray) -> np.ndarray:
+    def compute_geometric_features(self, landmarks: np.ndarray) -> np.ndarray:
         """
-        Compute first-order derivatives (velocity)
+        Compute geometric features
         
         Args:
-            landmarks_sequence: [T, N, 3] sequence of landmarks
+            landmarks: [N, 3] normalized landmarks
             
         Returns:
-            [T-1, N, 3] velocity vectors
+            [10] geometric features normalized to [0, 1]
         """
-        if landmarks_sequence.shape[0] < 2:
-            return np.zeros((0, landmarks_sequence.shape[1], 3))
-        return np.diff(landmarks_sequence, axis=0)
+        def safe_dist(i, j):
+            if i < len(landmarks) and j < len(landmarks):
+                return float(np.linalg.norm(landmarks[i] - landmarks[j]))
+            return 0.0
+        
+        features = []
+        
+        # Mouth dimensions
+        mouth_width = safe_dist(61, 291)
+        mouth_height = safe_dist(13, 14)
+        
+        features.append(mouth_width)
+        features.append(mouth_height)
+        
+        # Jaw opening
+        features.append(safe_dist(152, 0) if 152 < len(landmarks) else 0.0)
+        
+        # Aspect ratio
+        features.append(mouth_width / (mouth_height + 1e-6) if mouth_height > 1e-6 else 0.0)
+        
+        # Lip protrusion
+        features.append(landmarks[13, 2] if 13 < len(landmarks) else 0.0)
+        
+        # Mouth area (approximation)
+        features.append(mouth_width * mouth_height)
+        
+        # Inner mouth dimensions
+        inner_width = safe_dist(78, 308) if 78 < len(landmarks) and 308 < len(landmarks) else 0.0
+        features.append(inner_width)
+        
+        # Symmetry (left vs right)
+        left_height = safe_dist(61, 13)
+        right_height = safe_dist(291, 13)
+        features.append(abs(left_height - right_height))
+        
+        # Pad to 10
+        features.extend([0.0] * (10 - len(features)))
+        
+        return np.clip(features, 0, 1).astype(np.float32)
     
-    @staticmethod
-    def compute_acceleration(velocity: np.ndarray) -> np.ndarray:
+    def parse_speech_timing(self, video_path: Path, num_frames: int, fps: float) -> np.ndarray:
         """
-        Compute second-order derivatives (acceleration)
+        Parse speech timing from .txt file and create frame-level mask
         
         Args:
-            velocity: [T-1, N, 3] velocity vectors
+            video_path: Path to video file
+            num_frames: Total number of frames
+            fps: Video FPS
             
         Returns:
-            [T-2, N, 3] acceleration vectors
+            [num_frames] binary mask (1.0 = speech, 0.0 = silence)
         """
-        if velocity.shape[0] < 2:
-            return np.zeros((0, velocity.shape[1], 3))
-        return np.diff(velocity, axis=0)
+        mask = np.zeros(num_frames, dtype=np.float32)
         
-    @staticmethod
-    def compute_edge_features(landmarks: np.ndarray, edge_pairs: List[Tuple[int, int]]) -> np.ndarray:
-        """
-        Compute pairwise distances between connected landmarks
+        txt_path = video_path.with_suffix('.txt')
+        if not txt_path.exists():
+            return mask
         
-        Args:
-            landmarks: [N, 3] landmarks
-            edge_pairs: List of (src, dst) index pairs
+        try:
+            text = txt_path.read_text(encoding='utf-8', errors='ignore')
             
-        Returns:
-            [E,] array of edge distances
-        """
-        edges = []
-        for src, dst in edge_pairs:
-            if src < landmarks.shape[0] and dst < landmarks.shape[0]:
-                dist = np.linalg.norm(landmarks[src] - landmarks[dst])
-                edges.append(dist)
-        return np.array(edges)
-
-
-class FaceMeshExtractor:
-    #Extacat di 
-    """Main extractor class for processing videos"""
-    
-    # Mouth region edge connections (anatomically meaningful)
-    MOUTH_EDGES = [
-        (61, 291), (61, 0), (291, 0),  # Outer mouth corners
-        (13, 14), (37, 39), (40, 42),  # Vertical mouth
-        (61, 62), (62, 63), (63, 64),  # Upper lip chain
-        (291, 292), (292, 293), (293, 294),  # Lower lip chain
-    ]
-    
-    def __init__(self, config: FaceMeshConfig = None):
-        self.config = config or FaceMeshConfig()
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.normalizer = SpatialNormalizer()
-        self.feature_engineer = FeatureEngineer()
-        
-        # Initialize MediaPipe
-        # NOTE: MediaPipe models are generally safe to reuse across threads 
-        # but for simplicity and safety, the parallel method will handle its own setup.
-        # This setup is kept for single-threaded use (like in extract_from_video).
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=self.config.max_num_faces,
-            refine_landmarks=self.config.refine_landmarks,
-            min_detection_confidence=self.config.min_detection_confidence,
-            min_tracking_confidence=self.config.min_tracking_confidence
-        )
-        
-    def _extract_single_video(self, video_path: Path, word_name: str) -> Optional[Dict]:
-        """
-        Private helper for extracting a single video.
-        Uses a new MediaPipe context to ensure thread safety.
-        """
-        # Create a new, thread-local FaceMesh instance
-        with self.mp_face_mesh.FaceMesh(
-            max_num_faces=self.config.max_num_faces,
-            refine_landmarks=self.config.refine_landmarks,
-            min_detection_confidence=self.config.min_detection_confidence,
-            min_tracking_confidence=self.config.min_tracking_confidence
-        ) as face_mesh:
-        
-            cap = cv2.VideoCapture(str(video_path))
+            # Extract Start and End times
+            start_match = re.search(r'Start:\s*([0-9.]+)', text)
+            end_match = re.search(r'End:\s*([0-9.]+)', text)
             
-            if not cap.isOpened():
-                logger.error(f"Failed to open video: {video_path}")
-                return None
+            if start_match and end_match and fps > 0:
+                start_time = float(start_match.group(1))
+                end_time = float(end_match.group(1))
                 
+                # Convert to frame indices
+                start_frame = int(np.floor(start_time * fps))
+                end_frame = int(np.ceil(end_time * fps))
+                
+                # Clamp to valid range
+                start_frame = max(0, min(num_frames - 1, start_frame))
+                end_frame = max(0, min(num_frames - 1, end_frame))
+                
+                # Mark speech frames
+                if end_frame >= start_frame:
+                    mask[start_frame:end_frame + 1] = 1.0
+        
+        except Exception as e:
+            logger.warning(f"Failed to parse timing for {video_path.name}: {e}")
+        
+        return mask
+    
+    def extract_video(self, video_path: Path, word: str) -> Optional[Dict]:
+        """
+        Extract features from a single video
+        
+        Args:
+            video_path: Path to video
+            word: Word label
+            
+        Returns:
+            Dictionary with all features, or None if extraction failed
+        """
+        with self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.5
+        ) as face_mesh:
+            
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                return None
+            
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
-            all_landmarks = []
+            landmarks_sequence = []
+            detected_frames = 0
             
-            while cap.isOpened():
+            # Extract landmarks from each frame
+            while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                    
-                # Convert BGR to RGB
+                
+                # Convert to RGB
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
-                # Process frame
+                # Detect face landmarks
                 results = face_mesh.process(rgb_frame)
                 
                 if results.multi_face_landmarks:
-                    # Extract first face
+                    detected_frames += 1
+                    
+                    # Extract landmarks
                     face_landmarks = results.multi_face_landmarks[0]
+                    full_landmarks = np.array([
+                        [lm.x, lm.y, lm.z] for lm in face_landmarks.landmark
+                    ], dtype=np.float32)
                     
-                    # Convert to numpy array [468, 3]
-                    landmarks = np.array([
-                        [lm.x, lm.y, lm.z] 
-                        for lm in face_landmarks.landmark
-                    ])
+                    # Extract ROI
+                    roi_landmarks = full_landmarks[self.ROI_INDICES]
                     
-                    # Extract ROI landmarks only
-                    roi_landmarks = landmarks[self.config.roi_landmarks]
+                    # Normalize to [0, 1]
+                    normalized = self.normalize_landmarks(roi_landmarks)
                     
-                    # Normalize
-                    normalized = self.normalizer.normalize_landmarks(roi_landmarks)
-                    
-                    all_landmarks.append(normalized)
+                    landmarks_sequence.append(normalized)
                 else:
-                    # No face detected - use zeros or skip
-                    if len(all_landmarks) > 0:
-                        # Use last valid frame
-                        all_landmarks.append(all_landmarks[-1])
+                    # No face detected: use previous frame or zeros
+                    if landmarks_sequence:
+                        landmarks_sequence.append(landmarks_sequence[-1].copy())
                     else:
-                        # Use zero landmarks
-                        all_landmarks.append(
-                            np.zeros((len(self.config.roi_landmarks), 3))
-                        )
-                
+                        landmarks_sequence.append(np.zeros((len(self.ROI_INDICES), 3), dtype=np.float32))
+            
             cap.release()
             
-            if len(all_landmarks) == 0:
-                logger.warning(f"No landmarks extracted from {video_path}")
+            # Check detection quality
+            if not landmarks_sequence:
                 return None
             
-            # Convert to numpy array [T, N, 3]
-            landmarks_sequence = np.stack(all_landmarks, axis=0)
+            detection_rate = detected_frames / len(landmarks_sequence)
+            if detection_rate < 0.7:  # At least 70% detection
+                return None
             
-            # Compute features
-            features = self._compute_all_features(landmarks_sequence)
-            print(max(features[['velocity']])) # Debugging line
-
-            # Convert to torch tensors with optional float16
-            dtype = torch.float16 if self.config.use_float16 else torch.float32
+            # Convert to numpy array
+            landmarks_sequence = np.array(landmarks_sequence, dtype=np.float32)  # [T, N, 3]
+            T = len(landmarks_sequence)
             
-            result = {
+            # Compute features per frame
+            action_units_sequence = []
+            geometric_sequence = []
+            
+            for t in range(T):
+                aus = self.compute_action_units(landmarks_sequence[t])
+                geom = self.compute_geometric_features(landmarks_sequence[t])
+                
+                action_units_sequence.append(aus)
+                geometric_sequence.append(geom)
+            
+            action_units_sequence = np.array(action_units_sequence, dtype=np.float32)  # [T, 18]
+            geometric_sequence = np.array(geometric_sequence, dtype=np.float32)  # [T, 10]
+            
+            # Compute motion features
+            velocity = np.diff(landmarks_sequence, axis=0) if T > 1 else np.zeros((0, landmarks_sequence.shape[1], 3), dtype=np.float32)
+            acceleration = np.diff(velocity, axis=0) if velocity.shape[0] > 1 else np.zeros((0, landmarks_sequence.shape[1], 3), dtype=np.float32)
+            
+            # Parse speech mask
+            speech_mask = self.parse_speech_timing(video_path, T, fps)
+            
+            # Return as dictionary (features only, no metadata text)
+            return {
                 'video_id': video_path.stem,
-                'landmarks': torch.tensor(landmarks_sequence, dtype=dtype),
-                'features': {k: torch.tensor(v, dtype=dtype) for k, v in features.items()},
-                'metadata': {
-                    'original_fps': fps,
-                    'num_frames': frame_count,
-                    'extracted_frames': len(all_landmarks),
-                    'roi_size': len(self.config.roi_landmarks)
-                },
-                'label': word_name # Added label here for convenience
+                'label': word,
+                'landmarks': torch.from_numpy(landmarks_sequence),  # [T, N, 3]
+                'action_units': torch.from_numpy(action_units_sequence),  # [T, 18]
+                'geometric': torch.from_numpy(geometric_sequence),  # [T, 10]
+                'velocity': torch.from_numpy(velocity),  # [T-1, N, 3]
+                'acceleration': torch.from_numpy(acceleration),  # [T-2, N, 3]
+                'speech_mask': torch.from_numpy(speech_mask),  # [T]
+                'num_frames': T,
+                'detection_rate': detection_rate,
             }
-            
-            return result
-
-    # Rename old method to keep a clean interface for single video use if needed
-    extract_from_video = _extract_single_video 
     
-    def _compute_all_features(self, landmarks_sequence: np.ndarray) -> Dict[str, np.ndarray]:
-        """Compute all engineered features"""
-        features = {}
-        
-        # Action Unit Features (NEW)
-        if self.config.compute_action_units:
-            au_features = []
-            for frame_landmarks in landmarks_sequence:
-                au_features.append(self.feature_engineer.compute_action_units(frame_landmarks))
-            features['action_units'] = np.stack(au_features, axis=0)
-
-        # Geometric features per frame
-        if self.config.compute_geometric:
-            geometric_features = []
-            
-            for frame_landmarks in landmarks_sequence:
-                frame_features = self.feature_engineer.compute_geometric_features(frame_landmarks)
-                # Convert dict to array
-                feature_vector = np.array([
-                    frame_features.get('mouth_height', 0),
-                    frame_features.get('mouth_width', 0),
-                    frame_features.get('jaw_opening', 0),
-                    frame_features.get('lip_protrusion', 0),
-                    frame_features.get('lip_roundness', 0),
-                ])
-                geometric_features.append(feature_vector)
-            features['geometric'] = np.stack(geometric_features, axis=0)
-
-        
-        # Velocity features
-        if self.config.compute_velocity:
-            velocity = self.feature_engineer.compute_velocity(landmarks_sequence)
-            features['velocity'] = velocity
-            
-            # Acceleration
-            if self.config.compute_acceleration:
-                acceleration = self.feature_engineer.compute_acceleration(velocity)
-                features['acceleration'] = acceleration
-        
-        # Edge features per frame
-        if self.config.compute_edges:
-            edge_features = []
-            for frame_landmarks in landmarks_sequence:
-                edges = self.feature_engineer.compute_edge_features(
-                    frame_landmarks, 
-                    self.MOUTH_EDGES
-                )
-                edge_features.append(edges)
-            features['edges'] = np.stack(edge_features, axis=0)
-        
-        return features
-    
-    def process_dataset_split(
-        self, 
-        dataset_root: Path, 
-        split: str,
-        output_path: Path
-    ) -> None:
+    def process_dataset(self, dataset_root: Path, split: str, output_path: Path):
         """
-        Process entire dataset split in parallel and save to .pt file
+        Process entire dataset split
         
         Args:
-            dataset_root: Root directory of IDLRW-DATASET
-            split: 'train', 'test', or 'val'
-            output_path: Path to save output .pt file
+            dataset_root: Root directory (e.g., data/IDLRW-DATASET)
+            split: 'train', 'val', or 'test'
+            output_path: Output .pt file path
         """
-        logger.info(f"Processing {split} split with {self.config.num_workers} workers...")
+        logger.info(f"\nProcessing {split} split...")
         
-        all_samples = []
+        # Collect all videos
         video_tasks = []
-        
-        # 1. Collect all video paths and their labels
-        word_dirs = sorted([d for d in dataset_root.iterdir() if d.is_dir()])
-        for word_dir in word_dirs:
-            word_name = word_dir.name
-            split_dir = word_dir / split
-            
-            if not split_dir.exists():
-                logger.warning(f"Split directory not found: {split_dir}")
+        for word_dir in sorted(dataset_root.iterdir()):
+            if not word_dir.is_dir():
                 continue
             
-            video_files = sorted(split_dir.glob("*.mp4"))
-            for video_path in video_files:
-                video_tasks.append((video_path, word_name))
-        
-        # 2. Parallel Processing
-        # Using ThreadPoolExecutor for I/O and mixed tasks
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.num_workers) as executor:
-            # Submit all video extraction tasks
-            futures = [
-                executor.submit(self._extract_single_video, path, name) 
-                for path, name in video_tasks
-            ]
+            split_dir = word_dir / split
+            if not split_dir.exists():
+                continue
             
-            # Iterate through futures as they complete and collect results
-            # tqdm is used on the concurrent.futures.as_completed iterator
-            for future in tqdm(
-                concurrent.futures.as_completed(futures), 
-                total=len(futures), 
-                desc=f"Extracting {split} videos"
-            ):
+            for video_path in sorted(split_dir.glob("*.mp4")):
+                video_tasks.append((video_path, word_dir.name))
+        
+        logger.info(f"Found {len(video_tasks)} videos")
+        
+        # Process in parallel
+        samples = []
+        failed = 0
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = [executor.submit(self.extract_video, vp, word) for vp, word in video_tasks]
+            
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Extracting {split}"):
                 try:
                     result = future.result()
                     if result is not None:
-                        # result already contains 'label' from _extract_single_video
-                        all_samples.append(result)
-                except Exception as exc:
-                    logger.error(f"Video extraction generated an exception: {exc}")
-
+                        samples.append(result)
+                    else:
+                        failed += 1
+                except Exception as e:
+                    failed += 1
+                    logger.error(f"Extraction error: {e}")
         
-        # 3. Save Results
-        # Save to .pt file
+        # Save
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(all_samples, output_path)
+        torch.save(samples, output_path)
         
-        # Log statistics
-        total_size_mb = output_path.stat().st_size / (1024 * 1024)
-        logger.info(f"Saved {len(all_samples)} samples to {output_path}")
-        logger.info(f"File size: {total_size_mb:.2f} MB")
-        logger.info(f"Average size per sample: {total_size_mb / len(all_samples):.4f} MB")
-    
-    def __del__(self):
-        """Cleanup"""
-        if hasattr(self, 'face_mesh') and self.face_mesh is not None:
-            self.face_mesh.close()
+        # Statistics
+        success_rate = len(samples) / len(video_tasks) * 100
+        file_size_mb = output_path.stat().st_size / (1024 * 1024)
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"{split.upper()} STATISTICS")
+        logger.info(f"{'='*60}")
+        logger.info(f"Total videos: {len(video_tasks)}")
+        logger.info(f"Successful: {len(samples)}")
+        logger.info(f"Failed: {failed}")
+        logger.info(f"Success rate: {success_rate:.1f}%")
+        logger.info(f"Output size: {file_size_mb:.2f} MB")
+        logger.info(f"Saved to: {output_path}")
+        logger.info(f"{'='*60}\n")
 
 
 def main():
-    """Main execution function"""
-    # Setup paths
+    """Main extraction pipeline"""
     project_root = Path(__file__).parent.parent.parent
     dataset_root = project_root / "data" / "IDLRW-DATASET"
     output_dir = project_root / "data" / "processed"
     
-    # Initialize extractor
-    # Added num_workers to config
-    config = FaceMeshConfig(
-        use_float16=True,
-        compute_velocity=True,
-        compute_acceleration=True,
-        compute_geometric=True,
-        compute_edges=True,
-        compute_action_units=True, # <--- ENABLED AU COMPUTATION
-        num_workers= 7 # <--- Set the number of threads for parallel execution
-    )
+    extractor = FaceMeshExtractor(num_workers=-1)
     
-    extractor = FaceMeshExtractor(config)
-    
-    # Process all splits
-    for split in ['train', 'test', 'val']:
+    for split in ['train', 'val', 'test']:
         output_path = output_dir / f"{split}.pt"
-        extractor.process_dataset_split(
-            dataset_root=dataset_root,
-            split=split,
-            output_path=output_path
-        )
+        extractor.process_dataset(dataset_root, split, output_path)
     
-    logger.info("FaceMesh extraction complete!")
+    logger.info("✅ Extraction complete!")
 
 
 if __name__ == "__main__":
