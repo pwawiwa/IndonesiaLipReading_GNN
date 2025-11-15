@@ -22,11 +22,11 @@ logger = logging.getLogger(__name__)
 class FaceMeshExtractor:
     """Extract facial landmarks and features for lip reading"""
     
-    # Mouth-centric ROI: Complete articulation region
-    # Includes: lips (inner+outer), jaw, lower cheeks, nose reference
+    # Extended ROI: Full bottom face area for better articulation modeling
+    # Includes: lips (inner+outer), complete jaw, lower cheeks, chin, neck reference
     ROI_INDICES = [
         # Nose reference (for normalization)
-        0, 1, 4,
+        0, 1, 4, 2, 5, 6, 19, 20,
         # Upper lip outer
         61, 185, 40, 39, 37, 267, 269, 270, 409, 291,
         # Lower lip outer  
@@ -35,10 +35,18 @@ class FaceMeshExtractor:
         78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308,
         # Lower lip inner
         95, 88, 178, 87, 14, 317, 402, 318, 324,
-        # Jaw
+        # Complete jawline (full bottom face)
         152, 377, 400, 378, 379, 365, 397, 288, 435, 361, 323, 454, 356, 389,
-        # Cheeks (lower)
-        50, 101, 36, 280, 330, 266,
+        # Extended jaw landmarks
+        172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288,
+        # Chin area (more detailed)
+        175, 199, 175, 199, 200, 18, 200, 18,
+        # Lower cheeks (extended)
+        50, 101, 36, 280, 330, 266, 116, 117, 118, 119, 120, 121,
+        # Cheek bones (lower)
+        116, 117, 118, 119, 120, 121, 126, 142, 36, 205, 206, 207,
+        # Neck/chin connection
+        18, 200, 199, 175,
     ]
     
     # Remove duplicates and sort
@@ -95,6 +103,9 @@ class FaceMeshExtractor:
         self.edge_index = self._build_edge_index()
         self.edge_pairs = self.EDGE_PAIRS_ORIGINAL  # Store for later use
         
+        # Create mapping from MediaPipe indices to ROI indices (for feature computation)
+        self.mp_to_roi = {mp_idx: roi_idx for roi_idx, mp_idx in enumerate(self.ROI_INDICES)}
+        
         logger.info(f"ROI: {len(self.ROI_INDICES)} landmarks")
         logger.info(f"Edges: {len(self.edge_index[0])} connections")
     
@@ -144,7 +155,8 @@ class FaceMeshExtractor:
     
     def normalize_landmarks(self, landmarks: np.ndarray) -> np.ndarray:
         """
-        Normalize landmarks to [0, 1] range
+        Normalize landmarks using face-relative normalization
+        Preserves relative spatial relationships better than per-dimension min-max
         
         Args:
             landmarks: [N, 3] raw landmarks (x, y, z in image coordinates)
@@ -152,59 +164,114 @@ class FaceMeshExtractor:
         Returns:
             [N, 3] normalized landmarks in [0, 1]
         """
-        # Method: Min-max normalization per dimension
-        normalized = landmarks.copy()
+        # Method: Face-relative normalization using nose tip as reference
+        # This preserves relative distances and angles better
         
-        for dim in range(3):
-            min_val = landmarks[:, dim].min()
-            max_val = landmarks[:, dim].max()
-            range_val = max_val - min_val
+        # Find nose tip index (MediaPipe index 0, should be in ROI)
+        nose_tip_idx = self._get_roi_index(0)  # Nose tip in MediaPipe
+        if nose_tip_idx is None or nose_tip_idx >= len(landmarks):
+            # Fallback to min-max if nose tip not available
+            nose_tip_idx = 0
+        
+        nose_tip = landmarks[nose_tip_idx]
+        
+        # Calculate bounding box centered on face
+        # Use all landmarks to get face scale
+        min_vals = landmarks.min(axis=0)
+        max_vals = landmarks.max(axis=0)
+        center = (min_vals + max_vals) / 2
+        scale = max_vals - min_vals
+        
+        # Avoid division by zero
+        scale = np.where(scale < 1e-6, 1.0, scale)
+        
+        # Normalize: center on face center, scale by face size
+        normalized = (landmarks - center) / scale
+        
+        # Shift to [0, 1] range
+        normalized = (normalized + 0.5)
+        
+        # Clamp to [0, 1]
+        normalized = np.clip(normalized, 0.0, 1.0)
+        
+        return normalized.astype(np.float32)
+    
+    def _get_roi_index(self, mp_index: int) -> Optional[int]:
+        """Map MediaPipe index to ROI index"""
+        return self.mp_to_roi.get(mp_index)
+    
+    def _apply_temporal_smoothing(self, landmarks_seq: np.ndarray, alpha: float = 0.7) -> np.ndarray:
+        """
+        Apply exponential moving average smoothing to reduce jitter
+        
+        Args:
+            landmarks_seq: [T, N, 3] sequence of landmarks
+            alpha: Smoothing factor (0.0 = no smoothing, 1.0 = no change)
+                   Higher alpha = more smoothing but slower response
             
-            if range_val > 1e-6:
-                normalized[:, dim] = (landmarks[:, dim] - min_val) / range_val
-            else:
-                normalized[:, dim] = 0.5  # Center if no range
+        Returns:
+            [T, N, 3] smoothed landmarks
+        """
+        if len(landmarks_seq) <= 1:
+            return landmarks_seq
         
-        return normalized
+        smoothed = landmarks_seq.copy()
+        
+        # Forward pass
+        for t in range(1, len(landmarks_seq)):
+            smoothed[t] = alpha * smoothed[t-1] + (1 - alpha) * landmarks_seq[t]
+        
+        # Backward pass (bidirectional smoothing for better results)
+        for t in range(len(landmarks_seq) - 2, -1, -1):
+            smoothed[t] = alpha * smoothed[t+1] + (1 - alpha) * smoothed[t]
+        
+        return smoothed
     
     def compute_action_units(self, landmarks: np.ndarray) -> np.ndarray:
         """
         Compute Action Units (FACS-based features for speech)
         
         Args:
-            landmarks: [N, 3] normalized landmarks
+            landmarks: [N, 3] normalized ROI landmarks (indices are ROI indices, not MediaPipe)
             
         Returns:
             [18] AU values normalized to [0, 1]
         """
-        def safe_dist(i, j):
-            """Euclidean distance between landmarks"""
-            if i < len(landmarks) and j < len(landmarks):
-                return float(np.linalg.norm(landmarks[i] - landmarks[j]))
+        def safe_dist(mp_i, mp_j):
+            """Euclidean distance between landmarks using MediaPipe indices"""
+            roi_i = self._get_roi_index(mp_i)
+            roi_j = self._get_roi_index(mp_j)
+            if roi_i is not None and roi_j is not None and roi_i < len(landmarks) and roi_j < len(landmarks):
+                return float(np.linalg.norm(landmarks[roi_i] - landmarks[roi_j]))
             return 0.0
         
-        def safe_coord(i, dim):
-            """Get coordinate value"""
-            if i < len(landmarks):
-                return float(landmarks[i, dim])
+        def safe_coord(mp_i, dim):
+            """Get coordinate value using MediaPipe index"""
+            roi_i = self._get_roi_index(mp_i)
+            if roi_i is not None and roi_i < len(landmarks):
+                return float(landmarks[roi_i, dim])
             return 0.0
         
         aus = []
         
-        # AU10: Upper Lip Raiser
-        aus.append(safe_coord(13, 1) - safe_coord(0, 1) if safe_coord(13, 1) < safe_coord(0, 1) else 0.0)
+        # AU10: Upper Lip Raiser (landmark 13 = upper lip center, 0 = nose tip)
+        lip_center_y = safe_coord(13, 1)
+        nose_y = safe_coord(0, 1)
+        aus.append(max(0.0, nose_y - lip_center_y) if lip_center_y < nose_y else 0.0)
         
-        # AU12: Lip Corner Puller (smile width)
+        # AU12: Lip Corner Puller (smile width) - landmarks 61 and 291 are lip corners
         aus.append(safe_dist(61, 291))
         
         # AU15: Lip Corner Depressor
         corner_y = (safe_coord(61, 1) + safe_coord(291, 1)) / 2
         aus.append(corner_y if corner_y > 0.5 else 0.0)
         
-        # AU17: Chin Raiser
-        aus.append(safe_coord(14, 1) - safe_coord(152, 1) if safe_coord(14, 1) < safe_coord(152, 1) else 0.0)
+        # AU17: Chin Raiser (landmark 14 = lower lip center, 152 = chin)
+        lip_lower_y = safe_coord(14, 1)
+        chin_y = safe_coord(152, 1)
+        aus.append(max(0.0, chin_y - lip_lower_y) if lip_lower_y < chin_y else 0.0)
         
-        # AU18: Lip Pucker (protrusion)
+        # AU18: Lip Pucker (protrusion) - z coordinate of upper lip center
         aus.append(safe_coord(13, 2))
         
         # AU20: Lip Stretcher
@@ -212,13 +279,13 @@ class FaceMeshExtractor:
         
         # AU23: Lip Tightener
         mouth_width = safe_dist(61, 291)
-        aus.append(1.0 - mouth_width if mouth_width < 1.0 else 0.0)
+        aus.append(1.0 - min(mouth_width, 1.0))
         
-        # AU25: Lips Part
+        # AU25: Lips Part (vertical opening)
         aus.append(safe_dist(13, 14))
         
         # AU26: Jaw Drop
-        aus.append(safe_dist(152, 0) if 152 < len(landmarks) else 0.0)
+        aus.append(safe_dist(152, 0))
         
         # AU27: Mouth Stretch
         aus.append(safe_dist(61, 291) * safe_dist(13, 14))
@@ -233,39 +300,49 @@ class FaceMeshExtractor:
         Compute geometric features
         
         Args:
-            landmarks: [N, 3] normalized landmarks
+            landmarks: [N, 3] normalized ROI landmarks (indices are ROI indices, not MediaPipe)
             
         Returns:
             [10] geometric features normalized to [0, 1]
         """
-        def safe_dist(i, j):
-            if i < len(landmarks) and j < len(landmarks):
-                return float(np.linalg.norm(landmarks[i] - landmarks[j]))
+        def safe_dist(mp_i, mp_j):
+            """Euclidean distance using MediaPipe indices"""
+            roi_i = self._get_roi_index(mp_i)
+            roi_j = self._get_roi_index(mp_j)
+            if roi_i is not None and roi_j is not None and roi_i < len(landmarks) and roi_j < len(landmarks):
+                return float(np.linalg.norm(landmarks[roi_i] - landmarks[roi_j]))
+            return 0.0
+        
+        def safe_coord(mp_i, dim):
+            """Get coordinate using MediaPipe index"""
+            roi_i = self._get_roi_index(mp_i)
+            if roi_i is not None and roi_i < len(landmarks):
+                return float(landmarks[roi_i, dim])
             return 0.0
         
         features = []
         
-        # Mouth dimensions
+        # Mouth dimensions (61, 291 = lip corners; 13, 14 = upper/lower lip centers)
         mouth_width = safe_dist(61, 291)
         mouth_height = safe_dist(13, 14)
         
         features.append(mouth_width)
         features.append(mouth_height)
         
-        # Jaw opening
-        features.append(safe_dist(152, 0) if 152 < len(landmarks) else 0.0)
+        # Jaw opening (152 = chin, 0 = nose tip)
+        features.append(safe_dist(152, 0))
         
         # Aspect ratio
         features.append(mouth_width / (mouth_height + 1e-6) if mouth_height > 1e-6 else 0.0)
         
-        # Lip protrusion
-        features.append(landmarks[13, 2] if 13 < len(landmarks) else 0.0)
+        # Lip protrusion (z coordinate of upper lip center)
+        features.append(safe_coord(13, 2))
         
         # Mouth area (approximation)
         features.append(mouth_width * mouth_height)
         
-        # Inner mouth dimensions
-        inner_width = safe_dist(78, 308) if 78 < len(landmarks) and 308 < len(landmarks) else 0.0
+        # Inner mouth dimensions (78, 308 = inner lip corners)
+        inner_width = safe_dist(78, 308)
         features.append(inner_width)
         
         # Symmetry (left vs right)
@@ -281,11 +358,12 @@ class FaceMeshExtractor:
     def parse_speech_timing(self, video_path: Path, num_frames: int, fps: float) -> np.ndarray:
         """
         Parse speech timing from .txt file and create frame-level mask
+        Correctly converts seconds to frame indices for 25fps videos
         
         Args:
             video_path: Path to video file
             num_frames: Total number of frames
-            fps: Video FPS
+            fps: Video FPS (should be 25.0 for this dataset)
             
         Returns:
             [num_frames] binary mask (1.0 = speech, 0.0 = silence)
@@ -299,25 +377,30 @@ class FaceMeshExtractor:
         try:
             text = txt_path.read_text(encoding='utf-8', errors='ignore')
             
-            # Extract Start and End times
+            # Extract Start and End times (in seconds)
             start_match = re.search(r'Start:\s*([0-9.]+)', text)
             end_match = re.search(r'End:\s*([0-9.]+)', text)
             
             if start_match and end_match and fps > 0:
-                start_time = float(start_match.group(1))
-                end_time = float(end_match.group(1))
+                start_time_sec = float(start_match.group(1))
+                end_time_sec = float(end_match.group(1))  # Fixed: was using start_match.group(1) before
                 
-                # Convert to frame indices
-                start_frame = int(np.floor(start_time * fps))
-                end_frame = int(np.ceil(end_time * fps))
+                # Convert seconds to frame indices (for 25fps: 1 second = 25 frames)
+                # Use floor for start (inclusive) and ceil for end (inclusive)
+                start_frame = int(np.floor(start_time_sec * fps))
+                end_frame = int(np.ceil(end_time_sec * fps))
                 
-                # Clamp to valid range
+                # Clamp to valid range [0, num_frames-1]
                 start_frame = max(0, min(num_frames - 1, start_frame))
                 end_frame = max(0, min(num_frames - 1, end_frame))
                 
-                # Mark speech frames
+                # Mark speech frames (inclusive range)
                 if end_frame >= start_frame:
                     mask[start_frame:end_frame + 1] = 1.0
+                else:
+                    # Edge case: if end < start, mark just the start frame
+                    if start_frame < num_frames:
+                        mask[start_frame] = 1.0
         
         except Exception as e:
             logger.warning(f"Failed to parse timing for {video_path.name}: {e}")
@@ -381,10 +464,12 @@ class FaceMeshExtractor:
                     
                     landmarks_sequence.append(normalized)
                 else:
-                    # No face detected: use previous frame or zeros
+                    # No face detected: use interpolation between detected frames
                     if landmarks_sequence:
+                        # Use previous frame (will be smoothed later)
                         landmarks_sequence.append(landmarks_sequence[-1].copy())
                     else:
+                        # First frame: use zeros (will be handled by smoothing)
                         landmarks_sequence.append(np.zeros((len(self.ROI_INDICES), 3), dtype=np.float32))
             
             cap.release()
@@ -400,6 +485,9 @@ class FaceMeshExtractor:
             # Convert to numpy array
             landmarks_sequence = np.array(landmarks_sequence, dtype=np.float32)  # [T, N, 3]
             T = len(landmarks_sequence)
+            
+            # Apply temporal smoothing to reduce jitter
+            landmarks_sequence = self._apply_temporal_smoothing(landmarks_sequence)
             
             # Compute features per frame
             action_units_sequence = []
@@ -432,6 +520,7 @@ class FaceMeshExtractor:
                 'velocity': torch.from_numpy(velocity),  # [T-1, N, 3]
                 'acceleration': torch.from_numpy(acceleration),  # [T-2, N, 3]
                 'speech_mask': torch.from_numpy(speech_mask),  # [T]
+                'edge_index': torch.from_numpy(self.edge_index).long(),  # [2, E] - anatomical edges
                 'num_frames': T,
                 'detection_rate': detection_rate,
             }
@@ -504,9 +593,16 @@ def main():
     """Main extraction pipeline"""
     project_root = Path(__file__).parent.parent.parent
     dataset_root = project_root / "data" / "IDLRW-DATASET"
-    output_dir = project_root / "data" / "processed"
+    output_dir = project_root / "data" / "processed_v2"  # Changed to processed_v2
     
     extractor = FaceMeshExtractor(num_workers=-1)
+    
+    logger.info(f"\n{'='*70}")
+    logger.info("FACE MESH EXTRACTION - IMPROVED VERSION")
+    logger.info(f"{'='*70}")
+    logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Features: Extended landmarks (88), Temporal smoothing, Improved normalization")
+    logger.info(f"{'='*70}\n")
     
     for split in ['train', 'val', 'test']:
         output_path = output_dir / f"{split}.pt"

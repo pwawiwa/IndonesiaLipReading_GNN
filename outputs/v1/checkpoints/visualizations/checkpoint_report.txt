@@ -1,0 +1,45 @@
+================================================================================
+CHECKPOINT ANALYSIS REPORT
+================================================================================
+
+Generated: 2025-11-15 16:31:24
+
+SUMMARY
+--------------------------------------------------------------------------------
+Total Checkpoints: 10
+Total Size: 3.71 GB
+
+BEST CHECKPOINT
+--------------------------------------------------------------------------------
+Name: best_checkpoint.pth
+Epoch: 33
+Best Val Acc: 0.1122
+Best Val F1: 0.0648
+File Size: 380.22 MB
+
+LATEST CHECKPOINT
+--------------------------------------------------------------------------------
+Name: checkpoint_epoch_0800.pth
+Epoch: 800
+Epochs Trained: 800
+Final Val Acc: 0.0741
+Final Val F1: 0.0102
+File Size: 380.26 MB
+
+ALL CHECKPOINTS
+--------------------------------------------------------------------------------
+                                                  path                      name  file_size file_size_str  epoch  best_val_acc  best_val_f1  has_history  has_model  has_optimizer  has_scheduler  num_epochs_trained  final_train_loss  final_train_acc  final_val_loss  final_val_acc  final_val_f1  max_val_acc  max_val_f1  total_params  trainable_params
+      outputs/combined/checkpoints/best_checkpoint.pth       best_checkpoint.pth  398690482     380.22 MB     33      0.112179     0.064831         True       True           True           True                  33          3.279792         0.169270        3.795447       0.112179      0.064831     0.112179    0.064831      33219694                 0
+outputs/combined/checkpoints/checkpoint_epoch_0100.pth checkpoint_epoch_0100.pth  398695914     380.23 MB    100      0.112179     0.072591         True       True           True           True                 100          2.478594         0.310635        5.826670       0.096407      0.059405     0.112179    0.072591      33219694                 0
+outputs/combined/checkpoints/checkpoint_epoch_0200.pth checkpoint_epoch_0200.pth  398700394     380.23 MB    200      0.112179     0.080529         True       True           True           True                 200          1.394623         0.570162       10.122832       0.090244      0.057496     0.112179    0.080529      33219694                 0
+outputs/combined/checkpoints/checkpoint_epoch_0300.pth checkpoint_epoch_0300.pth  398704938     380.23 MB    300      0.112179     0.085722         True       True           True           True                 300          0.733861         0.764837       11.818838       0.091498      0.070484     0.112179    0.085722      33219694                 0
+outputs/combined/checkpoints/checkpoint_epoch_0400.pth checkpoint_epoch_0400.pth  398709418     380.24 MB    400      0.112179     0.085722         True       True           True           True                 400          0.408226         0.869761       14.701157       0.096825      0.077148     0.112179    0.085722      33219694                 0
+outputs/combined/checkpoints/checkpoint_epoch_0500.pth checkpoint_epoch_0500.pth  398713898     380.24 MB    500      0.112179     0.085722         True       True           True           True                 500          0.284559         0.910070       15.802314       0.095885      0.076052     0.112179    0.085722      33219694                 0
+outputs/combined/checkpoints/checkpoint_epoch_0600.pth checkpoint_epoch_0600.pth  398718442     380.25 MB    600      0.112179     0.085722         True       True           True           True                 600               NaN         0.073866             NaN       0.074055      0.010212     0.112179    0.085722      33219694                 0
+outputs/combined/checkpoints/checkpoint_epoch_0700.pth checkpoint_epoch_0700.pth  398722922     380.25 MB    700      0.112179     0.085722         True       True           True           True                 700               NaN         0.073866             NaN       0.074055      0.010212     0.112179    0.085722      33219694                 0
+outputs/combined/checkpoints/checkpoint_epoch_0800.pth checkpoint_epoch_0800.pth  398727402     380.26 MB    800      0.112179     0.085722         True       True           True           True                 800               NaN         0.073866             NaN       0.074055      0.010212     0.112179    0.085722      33219694                 0
+    outputs/combined/checkpoints/latest_checkpoint.pth     latest_checkpoint.pth  398725786     380.25 MB    800      0.112179     0.085722         True       True           True           True                 800               NaN         0.073866             NaN       0.074055      0.010212     0.112179    0.085722      33219694                 0
+
+================================================================================
+END OF REPORT
+================================================================================

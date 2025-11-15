@@ -53,3 +53,23 @@ logs/
 
 # Local reversible archive created during cleanup
 cleanup_archive/
+
+# Outputs and experiments (ignore most, but keep specific files)
+outputs/*
+!outputs/**/
+!outputs/**/training_curves_latest.png
+!outputs/**/classification_report*.txt
+
+# Reports (ignore most, but keep classification reports)
+reports/*
+!reports/**/
+!reports/classification_report*.txt
+
+
+archive
+docs
+
+
+
+
+

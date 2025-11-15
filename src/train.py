@@ -77,8 +77,8 @@ class Trainer:
         self.patience_counter = 0
         self.best_val_acc_for_patience = 0.0
         
-        # Optimizer with good learning rate
-        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        # Optimizer with stronger weight decay to reduce overfitting
+        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=2e-4)  # Increased from 1e-4
         
         # Scheduler
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -504,18 +504,18 @@ def main():
         'num_workers': 8,
         'lr': 1e-3,  
         'num_epochs': 1000, 
-        'spatial_dim': 512,
-        'temporal_dim': 512,
-        'spatial_layers': 5,
-        'temporal_layers': 3,
-        'dropout': 0.5,  # Increased from 0.3 to reduce overfitting
+        'spatial_dim': 256,  # Reduced for simplified model
+        'temporal_dim': 256,  # Reduced for simplified model
+        'spatial_layers': 3,  # Reduced for simplified model
+        'temporal_layers': 2,
+        'dropout': 0.5,  # Increased dropout for regularization
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'save_dir': 'outputs/combined',
+        'save_dir': 'outputs/combined_simplified',  # Output folder for simplified model
         'checkpoint_interval': 100,
         'early_stopping_patience': 50,  # Stop if no improvement for 50 epochs
         'early_stopping_min_delta': 0.001,  # Minimum improvement threshold
         'label_smoothing': 0.1,  # Add label smoothing for regularization
-        'enable_log_server': True,
+        'enable_log_server': False,  # Disabled - running separately via script
         'log_server': {
             'host': '0.0.0.0',
             'port': 8080,
@@ -568,15 +568,16 @@ def main():
     logger.info(f"  Num classes: {num_classes}")
     logger.info(f"  Sample batch shape: {sample.x.shape}")
     
-    # Create model
+    # Create model (simplified to reduce overfitting)
+    logger.info("Using Simplified Model (reduced complexity)")
     model = CombinedModel(
         input_dim=input_dim,
         num_classes=num_classes,
-        spatial_dim=config['spatial_dim'],
-        temporal_dim=config['temporal_dim'],
-        spatial_layers=config['spatial_layers'],
-        temporal_layers=config['temporal_layers'],
-        dropout=config['dropout']
+        spatial_dim=config.get('spatial_dim', 256),
+        temporal_dim=config.get('temporal_dim', 256),
+        spatial_layers=config.get('spatial_layers', 3),
+        temporal_layers=config.get('temporal_layers', 2),
+        dropout=config.get('dropout', 0.5)
     )
     
     # Train

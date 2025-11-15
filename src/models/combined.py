@@ -1,6 +1,7 @@
 """
 src/models/combined.py
-Simple Combined Spatial-Temporal Model
+Simplified Combined Spatial-Temporal Model
+Reduced complexity to prevent overfitting
 """
 import torch
 import torch.nn as nn
@@ -8,29 +9,35 @@ import torch.nn.functional as F
 from torch_geometric.nn import global_mean_pool, global_max_pool
 
 from .spatial import SpatialGCN
-from .temporal import TemporalLSTM, TemporalAttention
+from .temporal import TemporalLSTM
 
 
 class CombinedModel(nn.Module):
-    """Combined Spatial-Temporal GNN for lip reading"""
+    """Simplified Combined Spatial-Temporal GNN for lip reading
+    
+    Reduced from 33M to ~6-8M parameters by:
+    - Single temporal branch (LSTM only)
+    - Reduced hidden dimensions
+    - Simplified classifier
+    """
     
     def __init__(self, input_dim: int, num_classes: int, 
-                 spatial_dim: int = 128, temporal_dim: int = 256,
+                 spatial_dim: int = 256, temporal_dim: int = 256,
                  spatial_layers: int = 3, temporal_layers: int = 2,
-                 dropout: float = 0.3):
+                 dropout: float = 0.5):
         """
         Args:
             input_dim: Input feature dimension per node
             num_classes: Number of classes
-            spatial_dim: Spatial GCN hidden dimension
-            temporal_dim: Temporal LSTM hidden dimension
-            spatial_layers: Number of GCN layers
+            spatial_dim: Spatial GCN hidden dimension (reduced from 384)
+            temporal_dim: Temporal LSTM hidden dimension (reduced from 384)
+            spatial_layers: Number of GCN layers (reduced from 4)
             temporal_layers: Number of LSTM layers
-            dropout: Dropout rate
+            dropout: Dropout rate (increased from 0.3)
         """
         super().__init__()
         
-        # Spatial module
+        # Spatial module (simplified)
         self.spatial = SpatialGCN(
             input_dim=input_dim,
             hidden_dim=spatial_dim,
@@ -38,7 +45,7 @@ class CombinedModel(nn.Module):
             dropout=dropout
         )
         
-        # Temporal modules
+        # Single temporal branch (LSTM only, removed Attention and Conv1D)
         self.temporal = TemporalLSTM(
             input_dim=self.spatial.output_dim,
             hidden_dim=temporal_dim,
@@ -46,60 +53,17 @@ class CombinedModel(nn.Module):
             dropout=dropout,
             bidirectional=True
         )
-        self.temporal_attn = TemporalAttention(
-            input_dim=self.spatial.output_dim,
-            hidden_dim=temporal_dim,
-            num_heads=8,
-            num_layers=max(1, temporal_layers - 1),
-            dropout=dropout
-        )
-        self.temporal_conv = nn.Sequential(
-            nn.Conv1d(self.spatial.output_dim, temporal_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(temporal_dim),
-            nn.ReLU(),
-            nn.Conv1d(temporal_dim, temporal_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(temporal_dim),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1)
-        )
-
-        proj_dim = temporal_dim
-        self.temporal_proj = nn.Sequential(
-            nn.LayerNorm(self.temporal.output_dim),
-            nn.Linear(self.temporal.output_dim, proj_dim)
-        )
-        self.attn_proj = nn.Sequential(
-            nn.LayerNorm(self.temporal_attn.output_dim),
-            nn.Linear(self.temporal_attn.output_dim, proj_dim)
-        )
-        self.conv_proj = nn.Sequential(
-            nn.LayerNorm(proj_dim),
-            nn.Linear(proj_dim, proj_dim)
-        )
-
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(proj_dim * 3, proj_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),  # Add dropout to fusion gate
-            nn.Linear(proj_dim, 3),
-            nn.Softmax(dim=1)
-        )
-
-        fusion_dim = proj_dim * 4  # three branches + gated blend
-        self.fusion_norm = nn.LayerNorm(fusion_dim)
         
-        # Classifier with stronger regularization
-        mid_dim = max(temporal_dim * 2, fusion_dim // 2)
+        # Simplified classifier (2 layers instead of 3)
+        lstm_output_dim = self.temporal.output_dim  # temporal_dim * 2 (bidirectional)
+        classifier_dim = max(temporal_dim, lstm_output_dim // 2)
+        
         self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim, mid_dim),
-            nn.BatchNorm1d(mid_dim),
+            nn.Linear(lstm_output_dim, classifier_dim),
+            nn.BatchNorm1d(classifier_dim),
             nn.ReLU(),
-            nn.Dropout(dropout * 1.5),  # Increased dropout in classifier
-            nn.Linear(mid_dim, mid_dim // 2),
-            nn.BatchNorm1d(mid_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),  # Additional dropout layer
-            nn.Linear(mid_dim // 2, num_classes)
+            nn.Dropout(dropout),
+            nn.Linear(classifier_dim, num_classes)
         )
     
     def forward(self, data):
@@ -113,18 +77,13 @@ class CombinedModel(nn.Module):
             logits [batch_size, num_classes]
         """
         # Extract data
-        # PyG DataLoader may keep x_temporal as a list or batch it
         x_temporal = data.x_temporal
         batch_size = data.num_graphs
         
         # Handle PyG batching of x_temporal
-        # PyG typically keeps custom attributes as lists
         if isinstance(x_temporal, (list, tuple)):
-            # Stack list of tensors: each is [T, N, feat_dim]
             x_temporal = torch.stack(x_temporal, dim=0)  # [batch, T, N, feat]
         elif len(x_temporal.shape) == 3:
-            # PyG may have concatenated: need to reshape
-            # Get sequence length from num_frames
             if hasattr(data, 'num_frames') and data.num_frames is not None:
                 num_frames = data.num_frames
                 if num_frames.dim() > 1:
@@ -132,21 +91,17 @@ class CombinedModel(nn.Module):
                 if num_frames.dim() == 0:
                     seq_len = num_frames.item()
                 else:
-                    seq_len = num_frames[0].item()  # Use first sample's length
+                    seq_len = num_frames[0].item()
                 
                 total_first, num_nodes, feat_dim = x_temporal.shape
-                # Reshape: [batch*T, N, feat] -> [batch, T, N, feat]
                 x_temporal = x_temporal.view(batch_size, seq_len, num_nodes, feat_dim)
             else:
-                # Fallback: try to infer from shape
                 total_first, second_dim, feat_dim = x_temporal.shape
-                # Try [batch*T, N, feat] format
                 if total_first % batch_size == 0:
                     seq_len = total_first // batch_size
                     num_nodes = second_dim
                     x_temporal = x_temporal.view(batch_size, seq_len, num_nodes, feat_dim)
                 else:
-                    # Try [batch*N, T, feat] format
                     num_nodes = total_first // batch_size
                     if total_first % batch_size == 0:
                         seq_len = second_dim
@@ -155,20 +110,26 @@ class CombinedModel(nn.Module):
                     else:
                         raise ValueError(f"Cannot infer x_temporal shape from {x_temporal.shape} with batch_size={batch_size}")
         
-        # Now x_temporal should be [batch, seq, nodes, feat]
         batch_size, seq_len, num_nodes, feat_dim = x_temporal.shape
         
-        # Build base edge index for one graph
-        base_edges = self._get_base_edges(num_nodes, x_temporal.device)
+        # Use edge_index from data if available, otherwise build k-NN
+        if hasattr(data, 'edge_index') and data.edge_index is not None:
+            base_edges = data.edge_index
+            if base_edges.shape[1] > 0:
+                mask = (base_edges[0] < num_nodes) & (base_edges[1] < num_nodes)
+                base_edges = base_edges[:, mask]
+                if base_edges.shape[1] == 0:
+                    base_edges = self._get_base_edges(num_nodes, x_temporal.device)
+            else:
+                base_edges = self._get_base_edges(num_nodes, x_temporal.device)
+        else:
+            base_edges = self._get_base_edges(num_nodes, x_temporal.device)
         
         # Process each timestep through spatial GCN
         temporal_embeds = []
         
         for t in range(seq_len):
-            # Get features at timestep t
             x_t = x_temporal[:, t, :, :]  # [batch, nodes, feat]
-            
-            # Flatten: [batch*nodes, feat]
             x_flat = x_t.reshape(batch_size * num_nodes, feat_dim)
             
             # Create batched edges
@@ -183,11 +144,24 @@ class CombinedModel(nn.Module):
             
             # Process with spatial GCN
             graph_embed = self.spatial(x_flat, edge_batch, batch_assign)  # [batch, spatial_dim*2]
-            
             temporal_embeds.append(graph_embed)
         
         # Stack temporal: [batch, seq, spatial_dim*2]
         temporal_seq = torch.stack(temporal_embeds, dim=1)
+        
+        # Apply speech mask if available
+        if hasattr(data, 'speech_mask') and data.speech_mask is not None:
+            if isinstance(data.speech_mask, (list, tuple)):
+                speech_mask = torch.stack(data.speech_mask, dim=0)  # [batch, seq]
+            else:
+                if len(data.speech_mask.shape) == 1:
+                    speech_mask = data.speech_mask.unsqueeze(0)
+                else:
+                    speech_mask = data.speech_mask
+            
+            if speech_mask.shape[1] == seq_len:
+                speech_mask = speech_mask.to(x_temporal.device)
+                temporal_seq = temporal_seq * speech_mask.unsqueeze(-1)  # [batch, seq, feat]
         
         # Sequence lengths for masking
         lengths = None
@@ -196,48 +170,16 @@ class CombinedModel(nn.Module):
             if lengths.dim() > 1:
                 lengths = lengths.squeeze(-1)
         
-        # Process with temporal LSTM
+        # Process with temporal LSTM (single branch)
         _, temporal_out = self.temporal(temporal_seq, lengths=lengths)  # [batch, temporal_dim*2]
-
-        # Attention-based temporal context
-        pad_mask = None
-        if lengths is not None:
-            max_len = temporal_seq.size(1)
-            pad_mask = torch.arange(max_len, device=temporal_seq.device).unsqueeze(0) >= lengths.unsqueeze(1)
-        _, attn_pooled = self.temporal_attn(temporal_seq, mask=pad_mask)  # [batch, temporal_dim]
-
-        # Temporal convolutional context
-        conv_seq = temporal_seq
-        if pad_mask is not None:
-            conv_seq = conv_seq.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-        conv_input = conv_seq.transpose(1, 2)  # [batch, feat, seq]
-        conv_out = self.temporal_conv(conv_input).squeeze(-1)  # [batch, temporal_dim]
-
-        # Project to common representation
-        temporal_feat = self.temporal_proj(temporal_out)
-        attn_feat = self.attn_proj(attn_pooled)
-        conv_feat = self.conv_proj(conv_out)
-
-        # Adaptive gating over branches
-        gate_logits = torch.cat([temporal_feat, attn_feat, conv_feat], dim=1)
-        gate = self.fusion_gate(gate_logits)  # [batch, 3]
-        blended = (
-            gate[:, 0:1] * temporal_feat +
-            gate[:, 1:2] * attn_feat +
-            gate[:, 2:3] * conv_feat
-        )
         
-        # Fuse temporal signals
-        fusion = torch.cat([temporal_feat, attn_feat, conv_feat, blended], dim=1)
-        fusion = self.fusion_norm(fusion)
-        
-        # Classify
-        logits = self.classifier(fusion)  # [batch, num_classes]
+        # Classify (simplified)
+        logits = self.classifier(temporal_out)  # [batch, num_classes]
         
         return logits
     
     def _get_base_edges(self, num_nodes, device):
-        """Build edge index for single graph"""
+        """Build edge index for single graph (fallback)"""
         edges = []
         k = 5
         

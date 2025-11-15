@@ -50,9 +50,16 @@ class LipReadingDataset(Dataset):
         
         T, N, _ = landmarks.shape
         
-        # Build edge index (from extractor)
-        # Simple k-NN or anatomical connections
-        edge_index = self._build_edge_index(N)
+        # Use edge index from extractor if available, otherwise build k-NN
+        if 'edge_index' in sample:
+            edge_index = sample['edge_index']  # [2, E] - anatomical edges from extractor
+            # Verify edge_index matches number of nodes
+            if edge_index.max() >= N:
+                # If edge_index has more nodes than current sample, rebuild
+                edge_index = self._build_edge_index(N)
+        else:
+            # Fallback: build k-NN edges if not in sample
+            edge_index = self._build_edge_index(N)
         
         # Create node features per timestep
         # Each node gets: [x, y, z] + broadcasted [AU, geometric]
