@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import global_mean_pool, global_max_pool
 
 from .spatial import SpatialGCN
-from .temporal import TemporalLSTM
+from .temporal import TemporalLSTM, TemporalAttention
 
 
 class CombinedModel(nn.Module):
@@ -38,7 +38,7 @@ class CombinedModel(nn.Module):
             dropout=dropout
         )
         
-        # Temporal module
+        # Temporal modules
         self.temporal = TemporalLSTM(
             input_dim=self.spatial.output_dim,
             hidden_dim=temporal_dim,
@@ -46,13 +46,60 @@ class CombinedModel(nn.Module):
             dropout=dropout,
             bidirectional=True
         )
-        
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(self.temporal.output_dim, temporal_dim),
+        self.temporal_attn = TemporalAttention(
+            input_dim=self.spatial.output_dim,
+            hidden_dim=temporal_dim,
+            num_heads=8,
+            num_layers=max(1, temporal_layers - 1),
+            dropout=dropout
+        )
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(self.spatial.output_dim, temporal_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(temporal_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(temporal_dim, num_classes)
+            nn.Conv1d(temporal_dim, temporal_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(temporal_dim),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1)
+        )
+
+        proj_dim = temporal_dim
+        self.temporal_proj = nn.Sequential(
+            nn.LayerNorm(self.temporal.output_dim),
+            nn.Linear(self.temporal.output_dim, proj_dim)
+        )
+        self.attn_proj = nn.Sequential(
+            nn.LayerNorm(self.temporal_attn.output_dim),
+            nn.Linear(self.temporal_attn.output_dim, proj_dim)
+        )
+        self.conv_proj = nn.Sequential(
+            nn.LayerNorm(proj_dim),
+            nn.Linear(proj_dim, proj_dim)
+        )
+
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(proj_dim * 3, proj_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),  # Add dropout to fusion gate
+            nn.Linear(proj_dim, 3),
+            nn.Softmax(dim=1)
+        )
+
+        fusion_dim = proj_dim * 4  # three branches + gated blend
+        self.fusion_norm = nn.LayerNorm(fusion_dim)
+        
+        # Classifier with stronger regularization
+        mid_dim = max(temporal_dim * 2, fusion_dim // 2)
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim, mid_dim),
+            nn.BatchNorm1d(mid_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout * 1.5),  # Increased dropout in classifier
+            nn.Linear(mid_dim, mid_dim // 2),
+            nn.BatchNorm1d(mid_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),  # Additional dropout layer
+            nn.Linear(mid_dim // 2, num_classes)
         )
     
     def forward(self, data):
@@ -142,12 +189,50 @@ class CombinedModel(nn.Module):
         # Stack temporal: [batch, seq, spatial_dim*2]
         temporal_seq = torch.stack(temporal_embeds, dim=1)
         
+        # Sequence lengths for masking
+        lengths = None
+        if hasattr(data, 'num_frames') and data.num_frames is not None:
+            lengths = data.num_frames.to(x_temporal.device)
+            if lengths.dim() > 1:
+                lengths = lengths.squeeze(-1)
+        
         # Process with temporal LSTM
-        # TemporalLSTM returns (lstm_out, hidden_state)
-        _, temporal_out = self.temporal(temporal_seq)  # [batch, temporal_dim*2]
+        _, temporal_out = self.temporal(temporal_seq, lengths=lengths)  # [batch, temporal_dim*2]
+
+        # Attention-based temporal context
+        pad_mask = None
+        if lengths is not None:
+            max_len = temporal_seq.size(1)
+            pad_mask = torch.arange(max_len, device=temporal_seq.device).unsqueeze(0) >= lengths.unsqueeze(1)
+        _, attn_pooled = self.temporal_attn(temporal_seq, mask=pad_mask)  # [batch, temporal_dim]
+
+        # Temporal convolutional context
+        conv_seq = temporal_seq
+        if pad_mask is not None:
+            conv_seq = conv_seq.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        conv_input = conv_seq.transpose(1, 2)  # [batch, feat, seq]
+        conv_out = self.temporal_conv(conv_input).squeeze(-1)  # [batch, temporal_dim]
+
+        # Project to common representation
+        temporal_feat = self.temporal_proj(temporal_out)
+        attn_feat = self.attn_proj(attn_pooled)
+        conv_feat = self.conv_proj(conv_out)
+
+        # Adaptive gating over branches
+        gate_logits = torch.cat([temporal_feat, attn_feat, conv_feat], dim=1)
+        gate = self.fusion_gate(gate_logits)  # [batch, 3]
+        blended = (
+            gate[:, 0:1] * temporal_feat +
+            gate[:, 1:2] * attn_feat +
+            gate[:, 2:3] * conv_feat
+        )
+        
+        # Fuse temporal signals
+        fusion = torch.cat([temporal_feat, attn_feat, conv_feat, blended], dim=1)
+        fusion = self.fusion_norm(fusion)
         
         # Classify
-        logits = self.classifier(temporal_out)  # [batch, num_classes]
+        logits = self.classifier(fusion)  # [batch, num_classes]
         
         return logits
     

@@ -19,9 +19,28 @@ from typing import Optional
 
 from dataset.dataset import create_dataloaders
 from models.combined import CombinedModel
+from utils.log_dashboard import start_log_server
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
+
+
+def setup_file_logging(log_path: Path):
+    """Attach a file handler so training logs persist to disk."""
+    log_path = Path(log_path)
+    existing = [
+        handler for handler in logger.handlers
+        if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_path
+    ]
+    if existing:
+        return log_path
+    
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_path, mode='a')
+    file_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
+    logger.addHandler(file_handler)
+    logger.info(f"🔒 File logging enabled at {log_path}")
+    return log_path
 
 
 class Trainer:
@@ -32,7 +51,9 @@ class Trainer:
                  checkpoint_interval: int = 10, resume: bool = False,
                  resume_checkpoint: Optional[str] = None,
                  epochs_per_run: Optional[int] = None,
-                 label_smoothing: float = 0.0):
+                 label_smoothing: float = 0.0,
+                 early_stopping_patience: int = 50,
+                 early_stopping_min_delta: float = 0.001):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -51,6 +72,10 @@ class Trainer:
         self.epochs_per_run = epochs_per_run
         self.label_smoothing = label_smoothing
         self.start_epoch = 1
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_min_delta = early_stopping_min_delta
+        self.patience_counter = 0
+        self.best_val_acc_for_patience = 0.0
         
         # Optimizer with good learning rate
         self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -225,6 +250,25 @@ class Trainer:
                 }, self.save_dir / 'best_model.pth')
                 logger.info(f"✓ Saved best model (Acc: {val_acc:.4f}, F1: {val_f1:.4f})")
                 save_best = True
+            
+            # Early stopping logic
+            if val_acc > self.best_val_acc_for_patience + self.early_stopping_min_delta:
+                self.best_val_acc_for_patience = val_acc
+                self.patience_counter = 0
+                logger.info(f"✓ Validation improved, resetting patience counter")
+            else:
+                self.patience_counter += 1
+                logger.info(f"⏳ No improvement for {self.patience_counter}/{self.early_stopping_patience} epochs")
+                
+                if self.patience_counter >= self.early_stopping_patience:
+                    logger.info(f"\n{'='*60}")
+                    logger.info("EARLY STOPPING TRIGGERED")
+                    logger.info(f"{'='*60}")
+                    logger.info(f"Best Val Acc: {best_val_acc:.4f}")
+                    logger.info(f"Best Val F1: {best_val_f1:.4f}")
+                    logger.info(f"Stopped at epoch {epoch}")
+                    logger.info(f"{'='*60}\n")
+                    break
 
             # Periodic checkpoints to allow resuming/analysis mid-training
             should_checkpoint = (epoch % self.checkpoint_interval == 0) or save_best or (epoch == run_end_epoch)
@@ -453,21 +497,31 @@ class Trainer:
 
 
 def main():
-    # Config
+    # Config with anti-overfitting measures
     config = {
         'data_dir': Path('data/processed'),
-        'batch_size': 64,  # Good for RTX 4090
+        'batch_size': 64, 
         'num_workers': 8,
-        'lr': 1e-3,  # Good learning rate
-        'num_epochs': 100,  # No early stopping
-        'spatial_dim': 256,
+        'lr': 1e-3,  
+        'num_epochs': 1000, 
+        'spatial_dim': 512,
         'temporal_dim': 512,
-        'spatial_layers': 3,
-        'temporal_layers': 2,
-        'dropout': 0.4,
+        'spatial_layers': 5,
+        'temporal_layers': 3,
+        'dropout': 0.5,  # Increased from 0.3 to reduce overfitting
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'save_dir': 'outputs/combined',
-        'checkpoint_interval': 25,
+        'checkpoint_interval': 100,
+        'early_stopping_patience': 50,  # Stop if no improvement for 50 epochs
+        'early_stopping_min_delta': 0.001,  # Minimum improvement threshold
+        'label_smoothing': 0.1,  # Add label smoothing for regularization
+        'enable_log_server': True,
+        'log_server': {
+            'host': '0.0.0.0',
+            'port': 8080,
+            'entries': 10,
+            'refresh_minutes': 5,
+        },
     }
     
     logger.info("\n" + "="*60)
@@ -476,6 +530,25 @@ def main():
     for k, v in config.items():
         logger.info(f"{k:20s}: {v}")
     logger.info("="*60)
+    
+    log_path = Path(config['save_dir']) / 'training.log'
+    setup_file_logging(log_path)
+    log_server_info = None
+    if config.get('enable_log_server', False):
+        log_cfg = config.get('log_server', {})
+        host = log_cfg.get('host', '127.0.0.1')
+        port = log_cfg.get('port', 8080)
+        entries = log_cfg.get('entries', 10)
+        refresh_minutes = log_cfg.get('refresh_minutes', 5)
+        server, thread = start_log_server(
+            log_path=log_path,
+            host=host,
+            port=port,
+            entries=entries,
+            refresh_minutes=refresh_minutes
+        )
+        log_server_info = (server, thread)
+        logger.info(f"🌐 Log dashboard available at http://{host}:{port}/ (auto-refresh every {refresh_minutes} min)")
     
     # Load data
     train_loader, val_loader, test_loader, num_classes, label_map = create_dataloaders(
@@ -517,7 +590,10 @@ def main():
         num_epochs=config['num_epochs'],
         save_dir=config['save_dir'],
         label_map=label_map,
-        checkpoint_interval=config['checkpoint_interval']
+        checkpoint_interval=config['checkpoint_interval'],
+        label_smoothing=config.get('label_smoothing', 0.0),
+        early_stopping_patience=config.get('early_stopping_patience', 50),
+        early_stopping_min_delta=config.get('early_stopping_min_delta', 0.001)
     )
     
     trainer.train_all()

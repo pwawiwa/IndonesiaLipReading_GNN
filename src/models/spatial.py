@@ -48,12 +48,14 @@ class SpatialGCN(nn.Module):
         Returns:
             Graph embeddings [batch_size, output_dim]
         """
-        # Apply GCN layers
-        for conv, bn in zip(self.convs, self.bns):
+        # Apply GCN layers with stronger regularization
+        for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
             x = conv(x, edge_index)
             x = bn(x)
             x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+            # Increase dropout in later layers
+            dropout_rate = self.dropout * (1.0 + 0.2 * i / max(1, len(self.convs) - 1))
+            x = F.dropout(x, p=min(dropout_rate, 0.7), training=self.training)
         
         # Pool to graph level
         x_mean = global_mean_pool(x, batch)
