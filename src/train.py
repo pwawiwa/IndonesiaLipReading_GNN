@@ -19,6 +19,7 @@ from typing import Optional
 
 from dataset.dataset import create_dataloaders
 from models.combined import CombinedModel
+from models.ast_gcn import ASTGCNModel
 from utils.log_dashboard import start_log_server
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -499,14 +500,22 @@ class Trainer:
 
 
 def main():
-    # Load V4 Balanced Configuration
+    # Load Configuration (defaults to v5)
     import importlib.util
-    config_path = Path(__file__).parent.parent / 'configs' / 'v4_balanced.py'
+    import sys
+    
+    # Check if config file is specified via command line
+    if len(sys.argv) > 1 and sys.argv[1].endswith('.py'):
+        config_name = sys.argv[1]
+    else:
+        config_name = 'v5.py'  # Default to v5
+    
+    config_path = Path(__file__).parent.parent / 'configs' / config_name
     if config_path.exists():
-        spec = importlib.util.spec_from_file_location("v4_config", config_path)
-        v4_config_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(v4_config_module)
-        config = v4_config_module.config
+        spec = importlib.util.spec_from_file_location("config_module", config_path)
+        config_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(config_module)
+        config = config_module.config
         logger.info(f"✅ Loaded config from {config_path}")
     else:
         # Fallback to V4 balanced config (hardcoded)
@@ -582,17 +591,31 @@ def main():
     logger.info(f"  Num classes: {num_classes}")
     logger.info(f"  Sample batch shape: {sample.x.shape}")
     
-    # Create model (simplified to reduce overfitting)
-    logger.info("Using Simplified Model (reduced complexity)")
-    model = CombinedModel(
-        input_dim=input_dim,
-        num_classes=num_classes,
-        spatial_dim=config.get('spatial_dim', 256),
-        temporal_dim=config.get('temporal_dim', 256),
-        spatial_layers=config.get('spatial_layers', 3),
-        temporal_layers=config.get('temporal_layers', 2),
-        dropout=config.get('dropout', 0.5)
-    )
+    # Create model based on config
+    model_type = config.get('model_type', 'combined')
+    if model_type == 'ast_gcn':
+        logger.info("Using AST-GCN Model (Attention-based Spatial-Temporal)")
+        model = ASTGCNModel(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            spatial_dim=config.get('spatial_dim', 256),
+            temporal_dim=config.get('temporal_dim', 256),
+            spatial_layers=config.get('spatial_layers', 3),
+            temporal_layers=config.get('temporal_layers', 2),
+            num_heads=config.get('num_heads', 4),
+            dropout=config.get('dropout', 0.5)
+        )
+    else:
+        logger.info("Using Combined Model (Simplified)")
+        model = CombinedModel(
+            input_dim=input_dim,
+            num_classes=num_classes,
+            spatial_dim=config.get('spatial_dim', 256),
+            temporal_dim=config.get('temporal_dim', 256),
+            spatial_layers=config.get('spatial_layers', 3),
+            temporal_layers=config.get('temporal_layers', 2),
+            dropout=config.get('dropout', 0.5)
+        )
     
     # Train
     trainer = Trainer(

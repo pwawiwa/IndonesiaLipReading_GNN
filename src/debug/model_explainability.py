@@ -329,8 +329,8 @@ def main():
                        help='Output directory')
     parser.add_argument('--num_samples', type=int, default=10,
                        help='Number of samples to analyze')
-    parser.add_argument('--input_dim', type=int, default=31,
-                       help='Input dimension')
+    parser.add_argument('--input_dim', type=int, default=37,
+                       help='Input dimension (default: 37 = 3 pos + 3 vel + 3 acc + 18 AU + 10 geo)')
     
     args = parser.parse_args()
     

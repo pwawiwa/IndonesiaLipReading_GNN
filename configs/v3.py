@@ -1,6 +1,6 @@
 """
-V3 Resume Configuration
-Continue training V3 with adjusted early stopping and slightly reduced regularization
+V3 Configuration
+Simplified model with strong regularization to prevent overfitting
 """
 from pathlib import Path
 
@@ -23,7 +23,7 @@ config = {
     'label_smoothing': 0.15,  # Reduced from 0.2
     
     'device': 'cuda' if __import__('torch').cuda.is_available() else 'cpu',
-    'save_dir': 'outputs/v3_resume',
+    'save_dir': 'outputs/v3',
     'checkpoint_interval': 100,
     
     # Early stopping: Much more patient
@@ -38,11 +38,12 @@ config = {
         'refresh_minutes': 5,
     },
     
-    # Resume training from V3 checkpoint
-    'resume': True,
-    'resume_checkpoint': 'outputs/v3/checkpoints/checkpoint_epoch_0074.pth',  # Last epoch before early stop
+    # Resume training (optional)
+    'resume': False,
+    'resume_checkpoint': None,
 }
 
-# Expected: V3 might reach 18-20% if given more time
-# This is a quick experiment to see if V3 was stopped too early
+# Expected parameters: ~858K (simplified architecture)
+# Expected test accuracy: 18-22%
+# Expected train-val gap: <5%
 

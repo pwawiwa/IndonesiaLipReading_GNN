@@ -27,7 +27,7 @@ def run_comprehensive_debug(
     output_dir: str = 'debug_outputs/comprehensive',
     num_facemesh_samples: int = 10,
     num_explanation_samples: int = 10,
-    input_dim: int = 31
+    input_dim: int = 37  # Updated: 31 (static) + 3 (velocity) + 3 (acceleration) = 37
 ):
     """
     Run comprehensive debugging analysis
@@ -170,8 +170,8 @@ def main():
                        help='Number of samples for facemesh visualization')
     parser.add_argument('--num_explanation_samples', type=int, default=10,
                        help='Number of samples for explanation')
-    parser.add_argument('--input_dim', type=int, default=31,
-                       help='Input dimension')
+    parser.add_argument('--input_dim', type=int, default=37,
+                       help='Input dimension (default: 37 = 3 pos + 3 vel + 3 acc + 18 AU + 10 geo)')
     
     args = parser.parse_args()
     

@@ -385,8 +385,8 @@ def main():
                        help='Path to test.pt file')
     parser.add_argument('--output', type=str, default='debug_outputs/evaluation',
                        help='Output directory')
-    parser.add_argument('--input_dim', type=int, default=31,
-                       help='Input dimension')
+    parser.add_argument('--input_dim', type=int, default=37,
+                       help='Input dimension (default: 37 = 3 pos + 3 vel + 3 acc + 18 AU + 10 geo)')
     parser.add_argument('--num_classes', type=int, default=None,
                        help='Number of classes (will be inferred if not provided)')
     

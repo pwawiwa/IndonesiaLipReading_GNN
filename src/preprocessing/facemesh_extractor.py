@@ -303,7 +303,7 @@ class FaceMeshExtractor:
             landmarks: [N, 3] normalized ROI landmarks (indices are ROI indices, not MediaPipe)
             
         Returns:
-            [10] geometric features normalized to [0, 1]
+            [15] geometric features normalized to [0, 1] (includes inner lip features)
         """
         def safe_dist(mp_i, mp_j):
             """Euclidean distance using MediaPipe indices"""
@@ -345,13 +345,27 @@ class FaceMeshExtractor:
         inner_width = safe_dist(78, 308)
         features.append(inner_width)
         
+        # Inner lip height (13 = upper inner center, 14 = lower inner center)
+        inner_height = safe_dist(13, 14)
+        features.append(inner_height)
+        
+        # Inner lip area (approximation)
+        inner_area = inner_width * inner_height
+        features.append(inner_area)
+        
+        # Inner/outer ratios
+        inner_outer_width_ratio = inner_width / (mouth_width + 1e-6) if mouth_width > 1e-6 else 0.0
+        inner_outer_height_ratio = inner_height / (mouth_height + 1e-6) if mouth_height > 1e-6 else 0.0
+        features.append(inner_outer_width_ratio)
+        features.append(inner_outer_height_ratio)
+        
         # Symmetry (left vs right)
         left_height = safe_dist(61, 13)
         right_height = safe_dist(291, 13)
         features.append(abs(left_height - right_height))
         
-        # Pad to 10
-        features.extend([0.0] * (10 - len(features)))
+        # Pad to 15 (expanded from 10)
+        features.extend([0.0] * (15 - len(features)))
         
         return np.clip(features, 0, 1).astype(np.float32)
     

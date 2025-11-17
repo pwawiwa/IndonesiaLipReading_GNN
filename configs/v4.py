@@ -1,6 +1,6 @@
 """
-V4 Balanced Configuration
-Sweet spot between V2 (overfitting) and V3 (underfitting)
+V4 Configuration
+Balanced model between V2 (overfitting) and V3 (underfitting)
 """
 from pathlib import Path
 
