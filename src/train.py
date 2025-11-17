@@ -53,7 +53,8 @@ class Trainer:
                  epochs_per_run: Optional[int] = None,
                  label_smoothing: float = 0.0,
                  early_stopping_patience: int = 50,
-                 early_stopping_min_delta: float = 0.001):
+                 early_stopping_min_delta: float = 0.001,
+                 weight_decay: float = 1e-3):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -76,9 +77,10 @@ class Trainer:
         self.early_stopping_min_delta = early_stopping_min_delta
         self.patience_counter = 0
         self.best_val_acc_for_patience = 0.0
+        self.weight_decay = weight_decay
         
         # Optimizer with stronger weight decay to reduce overfitting
-        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=2e-4)  # Increased from 1e-4
+        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         
         # Scheduler
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -497,32 +499,44 @@ class Trainer:
 
 
 def main():
-    # Config with anti-overfitting measures
-    config = {
-        'data_dir': Path('data/processed'),
-        'batch_size': 64, 
-        'num_workers': 8,
-        'lr': 1e-3,  
-        'num_epochs': 1000, 
-        'spatial_dim': 256,  # Reduced for simplified model
-        'temporal_dim': 256,  # Reduced for simplified model
-        'spatial_layers': 3,  # Reduced for simplified model
-        'temporal_layers': 2,
-        'dropout': 0.5,  # Increased dropout for regularization
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'save_dir': 'outputs/combined_simplified',  # Output folder for simplified model
-        'checkpoint_interval': 100,
-        'early_stopping_patience': 50,  # Stop if no improvement for 50 epochs
-        'early_stopping_min_delta': 0.001,  # Minimum improvement threshold
-        'label_smoothing': 0.1,  # Add label smoothing for regularization
-        'enable_log_server': False,  # Disabled - running separately via script
-        'log_server': {
-            'host': '0.0.0.0',
-            'port': 8080,
-            'entries': 10,
-            'refresh_minutes': 5,
-        },
-    }
+    # Load V4 Balanced Configuration
+    import importlib.util
+    config_path = Path(__file__).parent.parent / 'configs' / 'v4_balanced.py'
+    if config_path.exists():
+        spec = importlib.util.spec_from_file_location("v4_config", config_path)
+        v4_config_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(v4_config_module)
+        config = v4_config_module.config
+        logger.info(f"✅ Loaded config from {config_path}")
+    else:
+        # Fallback to V4 balanced config (hardcoded)
+        logger.warning(f"Config file not found at {config_path}, using hardcoded V4 config")
+        config = {
+            'data_dir': Path('data/processed'),
+            'batch_size': 32,
+            'num_workers': 8,
+            'lr': 7.5e-4,  # Between V2 (1e-3) and V3 (5e-4)
+            'num_epochs': 1000,
+            'spatial_dim': 192,  # Between V2 (256) and V3 (128)
+            'temporal_dim': 192,
+            'spatial_layers': 2,
+            'temporal_layers': 2,
+            'dropout': 0.6,  # Between V2 (0.5) and V3 (0.7)
+            'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+            'save_dir': 'outputs/v4',
+            'checkpoint_interval': 100,
+            'early_stopping_patience': 200,  # Very patient
+            'early_stopping_min_delta': 0.0005,
+            'label_smoothing': 0.15,  # Between V2 (0.1) and V3 (0.2)
+            'weight_decay': 5e-4,  # Between V2 (2e-4) and V3 (1e-3)
+            'enable_log_server': False,
+            'log_server': {
+                'host': '0.0.0.0',
+                'port': 8080,
+                'entries': 10,
+                'refresh_minutes': 5,
+            },
+        }
     
     logger.info("\n" + "="*60)
     logger.info("CONFIGURATION")
@@ -594,7 +608,8 @@ def main():
         checkpoint_interval=config['checkpoint_interval'],
         label_smoothing=config.get('label_smoothing', 0.0),
         early_stopping_patience=config.get('early_stopping_patience', 50),
-        early_stopping_min_delta=config.get('early_stopping_min_delta', 0.001)
+        early_stopping_min_delta=config.get('early_stopping_min_delta', 0.001),
+        weight_decay=config.get('weight_decay', 1e-3)
     )
     
     trainer.train_all()

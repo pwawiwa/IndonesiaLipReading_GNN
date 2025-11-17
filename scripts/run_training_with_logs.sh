@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="/home/member2/tomoooo/IndonesiaLipReading_GNN"
 cd "$ROOT"
 
-LOG_DIR="outputs/combined_simplified"
+LOG_DIR="outputs/v3"
 mkdir -p "$LOG_DIR"
 
 # Log server configuration
