@@ -248,17 +248,22 @@ class ASTGCNModel(nn.Module):
         
         batch_size, seq_len, num_nodes, feat_dim = x_temporal.shape
         
-        # Get edge index
+        # Get edge index from data (MediaPipe FACEMESH_TESSELATION for full face)
+        # Should always be present for processed_v3 data
         if hasattr(data, 'edge_index') and data.edge_index is not None:
             base_edges = data.edge_index
             if base_edges.shape[1] > 0:
+                # Filter edges to valid nodes (should match num_nodes=468 for full face)
                 mask = (base_edges[0] < num_nodes) & (base_edges[1] < num_nodes)
                 base_edges = base_edges[:, mask]
                 if base_edges.shape[1] == 0:
+                    # Fallback if no valid edges (shouldn't happen)
                     base_edges = self._get_base_edges(num_nodes, x_temporal.device)
             else:
+                # Empty edge_index - use fallback
                 base_edges = self._get_base_edges(num_nodes, x_temporal.device)
         else:
+            # Missing edge_index - use fallback (shouldn't happen with processed_v3)
             base_edges = self._get_base_edges(num_nodes, x_temporal.device)
         
         # Process each timestep through attention-based spatial GCN
@@ -315,7 +320,11 @@ class ASTGCNModel(nn.Module):
         return logits
     
     def _get_base_edges(self, num_nodes, device):
-        """Build edge index for single graph (fallback)"""
+        """
+        Build edge index for single graph (fallback only)
+        Should not be needed since edge_index is provided from extractor
+        Uses simple k-NN as fallback if edge_index is missing
+        """
         edges = []
         k = 5
         

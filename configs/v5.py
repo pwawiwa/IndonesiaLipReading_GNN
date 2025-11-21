@@ -1,25 +1,29 @@
 """
-V5 Configuration - AST-GCN Model
+V5 Configuration - AST-GCN Model (Reduced Complexity)
 Attention-based Spatial-Temporal Graph Convolutional Network
-With advanced features: Gabor, Recurrence, FFT, Multi-scale, Relative motion
+Reduced model complexity and advanced features disabled for memory efficiency
+Updated for full face (468 landmarks) with MediaPipe FACEMESH_TESSELATION connections
 """
 from pathlib import Path
 
 config = {
-    'data_dir': Path('data/processed_v2'),  # Using existing processed data
+    'data_dir': Path('data/processed_v3'),  # Full face (468 landmarks) with MediaPipe connections
     'batch_size': 32,
     'num_workers': 8,
     'lr': 5e-4,  # Slightly lower for attention mechanisms
     'num_epochs': 1000,
     
-    # Architecture: AST-GCN with attention
+    # Architecture: AST-GCN with attention (reduced complexity)
     'model_type': 'ast_gcn',  # Use AST-GCN model
-    'spatial_dim': 256,
-    'temporal_dim': 256,
-    'spatial_layers': 3,
-    'temporal_layers': 2,
-    'num_heads': 4,  # Attention heads for GAT
+    'spatial_dim': 128,  # Reduced from 256 (50% reduction)
+    'temporal_dim': 128,  # Reduced from 256 (50% reduction)
+    'spatial_layers': 2,  # Reduced from 3 (33% reduction)
+    'temporal_layers': 2,  # Keep at 2 for multi-scale temporal modeling
+    'num_heads': 2,  # Reduced from 4 (50% reduction)
     'dropout': 0.5,
+    
+    # Disable advanced features (redundant with GCN+LSTM)
+    'use_advanced_features': False,  # Disable Gabor, FFT, Recurrence, Multi-scale, Relative motion
     
     # Regularization
     'weight_decay': 5e-4,

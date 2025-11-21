@@ -1,5 +1,6 @@
 #!/bin/bash
 # Run V5 AST-GCN training in background (survives disconnection)
+# Uses full face (468 landmarks) with MediaPipe FACEMESH_TESSELATION connections
 set -euo pipefail
 
 ROOT="/home/member2/tomoooo/IndonesiaLipReading_GNN"
@@ -12,11 +13,11 @@ STDOUT_LOG="$LOG_DIR/train_stdout.log"
 STDERR_LOG="$LOG_DIR/train_stderr.log"
 
 echo "=========================================="
-echo "Starting V5 AST-GCN Training"
+echo "V5 AST-GCN Training"
+echo "Full Face (468 landmarks) + MediaPipe Connections"
 echo "=========================================="
+echo "Config: configs/v5.py (processed_v3)"
 echo "Log directory: $LOG_DIR"
-echo "Stdout log: $STDOUT_LOG"
-echo "Stderr log: $STDERR_LOG"
 echo "=========================================="
 
 # Kill existing training if it exists
@@ -42,14 +43,13 @@ if command -v screen &> /dev/null; then
     fi
     
     echo ""
-    echo "Starting in screen session: $SCREEN_NAME"
+    echo "Starting training in screen session: $SCREEN_NAME"
     echo "To attach: screen -r $SCREEN_NAME"
     echo "To detach: Ctrl+A then D"
     
-    # Start screen session
-    screen -dmS "$SCREEN_NAME" bash -c "cd '$ROOT' && python3 -u src/train.py > '$STDOUT_LOG' 2> '$STDERR_LOG'; exec bash"
+    # Start training directly
+    screen -dmS "$SCREEN_NAME" bash -c "cd '$ROOT' && python3 -u src/train.py v5.py > '$STDOUT_LOG' 2> '$STDERR_LOG'; exec bash"
     
-    # Get the PID of the python process in screen (approximate)
     sleep 2
     PYTHON_PID=$(ps aux | grep "[p]ython3.*src/train.py" | awk '{print $2}' | head -1)
     if [ -n "$PYTHON_PID" ]; then
@@ -67,10 +67,11 @@ if command -v screen &> /dev/null; then
     echo "  tail -f $STDOUT_LOG"
     
 else
-    # Fallback to nohup
+    # Fallback to nohup with setsid for better persistence
     echo ""
-    echo "Starting training with nohup (screen not available)..."
-    nohup python3 -u src/train.py \
+    echo "Starting training with nohup + setsid (screen not available)..."
+    # Use setsid to create a new session, and redirect all output properly
+    nohup setsid bash -c "cd '$ROOT' && exec python3 -u src/train.py v5.py" \
         > "$STDOUT_LOG" 2> "$STDERR_LOG" &
     TRAIN_PID=$!
     echo "$TRAIN_PID" > "$LOG_DIR/train.pid"

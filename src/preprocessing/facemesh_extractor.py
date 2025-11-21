@@ -22,74 +22,12 @@ logger = logging.getLogger(__name__)
 class FaceMeshExtractor:
     """Extract facial landmarks and features for lip reading"""
     
-    # Extended ROI: Full bottom face area for better articulation modeling
-    # Includes: lips (inner+outer), complete jaw, lower cheeks, chin, neck reference
-    ROI_INDICES = [
-        # Nose reference (for normalization)
-        0, 1, 4, 2, 5, 6, 19, 20,
-        # Upper lip outer
-        61, 185, 40, 39, 37, 267, 269, 270, 409, 291,
-        # Lower lip outer  
-        146, 91, 181, 84, 17, 314, 405, 321, 375,
-        # Upper lip inner
-        78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308,
-        # Lower lip inner
-        95, 88, 178, 87, 14, 317, 402, 318, 324,
-        # Complete jawline (full bottom face)
-        152, 377, 400, 378, 379, 365, 397, 288, 435, 361, 323, 454, 356, 389,
-        # Extended jaw landmarks
-        172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397, 288,
-        # Chin area (more detailed)
-        175, 199, 175, 199, 200, 18, 200, 18,
-        # Lower cheeks (extended)
-        50, 101, 36, 280, 330, 266, 116, 117, 118, 119, 120, 121,
-        # Cheek bones (lower)
-        116, 117, 118, 119, 120, 121, 126, 142, 36, 205, 206, 207,
-        # Neck/chin connection
-        18, 200, 199, 175,
-    ]
+    # Use ALL 468 MediaPipe face landmarks (full face)
+    ROI_INDICES = list(range(468))  # All landmarks from 0 to 467
     
-    # Remove duplicates and sort
-    ROI_INDICES = sorted(list(set(ROI_INDICES)))
-    
-    # Edge connections (anatomical structure)
-    # We'll map these after ROI is defined
-    # Original MediaPipe indices that should be connected
-    EDGE_PAIRS_ORIGINAL = [
-        # Lips outer contour (complete loop)
-        (61, 185), (185, 40), (40, 39), (39, 37), (37, 0),
-        (0, 267), (267, 269), (269, 270), (270, 409), (409, 291),
-        (291, 375), (375, 321), (321, 405), (405, 314), (314, 17),
-        (17, 84), (84, 181), (181, 91), (91, 146), (146, 61),
-        
-        # Lips inner contour (complete loop)
-        (78, 191), (191, 80), (80, 81), (81, 82), (82, 13),
-        (13, 312), (312, 311), (311, 310), (310, 415), (415, 308),
-        (308, 324), (324, 318), (318, 402), (402, 317), (317, 14),
-        (14, 87), (87, 178), (178, 88), (88, 95), (95, 78),
-        
-        # Connect outer to inner
-        (61, 78), (291, 308), (13, 0), (14, 152),
-        
-        # Vertical connections (mouth opening)
-        (61, 13), (61, 14), (291, 13), (291, 14),
-        (0, 13), (0, 14),
-        
-        # Jaw connections
-        (152, 377), (377, 400), (400, 378), (378, 379), (379, 365),
-        (365, 397), (397, 288), (288, 435), (435, 361), (361, 323),
-        (323, 454), (454, 356), (356, 389), (389, 152),
-        
-        # Jaw to lips
-        (152, 14), (152, 17), (152, 0),
-        
-        # Cheeks to mouth
-        (50, 61), (50, 0), (101, 61), (36, 37),
-        (280, 291), (330, 291), (266, 267), (280, 0),
-        
-        # Nose anchors
-        (0, 1), (1, 4), (4, 0),
-    ]
+    # Use MediaPipe's default face mesh connections (FACEMESH_TESSELATION)
+    # This gives us the actual triangular mesh topology used by MediaPipe
+    # EDGE_PAIRS_ORIGINAL will be set in __init__ using MediaPipe's FACEMESH_TESSELATION
     
     def __init__(self, num_workers: int = -1):
         """
@@ -99,57 +37,53 @@ class FaceMeshExtractor:
         self.num_workers = num_workers if num_workers > 0 else os.cpu_count()
         self.mp_face_mesh = mp.solutions.face_mesh
         
-        # Build edge index mapping
+        # Use all 468 landmarks (full face)
+        self.ROI_INDICES = self.ROI_INDICES  # All 468 landmarks
+        
+        # Get MediaPipe's default face mesh connections (FACEMESH_TESSELATION)
+        # This is the actual triangular mesh topology used by MediaPipe
+        self.EDGE_PAIRS_ORIGINAL = list(self.mp_face_mesh.FACEMESH_TESSELATION)
+        
+        # Build edge index mapping using MediaPipe's default connections
         self.edge_index = self._build_edge_index()
         self.edge_pairs = self.EDGE_PAIRS_ORIGINAL  # Store for later use
         
         # Create mapping from MediaPipe indices to ROI indices (for feature computation)
+        # Since we use all landmarks, this is just identity mapping
         self.mp_to_roi = {mp_idx: roi_idx for roi_idx, mp_idx in enumerate(self.ROI_INDICES)}
         
-        logger.info(f"ROI: {len(self.ROI_INDICES)} landmarks")
-        logger.info(f"Edges: {len(self.edge_index[0])} connections")
+        logger.info(f"ROI: {len(self.ROI_INDICES)} landmarks (full face - all 468 landmarks)")
+        logger.info(f"Edges: {len(self.edge_index[0])} connections (from MediaPipe FACEMESH_TESSELATION)")
     
     def _build_edge_index(self) -> np.ndarray:
         """
-        Build edge index for ROI landmarks
-        Maps original landmark indices to ROI indices
+        Build edge index using MediaPipe's default face mesh connections
+        Since we use all 468 landmarks, we can directly use FACEMESH_TESSELATION
         
         Returns:
-            [2, E] edge index where each edge is (src_roi_idx, dst_roi_idx)
+            [2, E] edge index where each edge is (src_idx, dst_idx) in ROI space
         """
-        # Create mapping from original index to ROI index
-        orig_to_roi = {orig_idx: roi_idx for roi_idx, orig_idx in enumerate(self.ROI_INDICES)}
-        
         edges = []
+        edge_set = set()  # Use set to avoid duplicates efficiently
         
-        # Add anatomical edges
+        # Add all MediaPipe face mesh connections (FACEMESH_TESSELATION)
+        # Since we use all landmarks, all connections are valid
         for src_orig, dst_orig in self.EDGE_PAIRS_ORIGINAL:
-            if src_orig in orig_to_roi and dst_orig in orig_to_roi:
-                src_roi = orig_to_roi[src_orig]
-                dst_roi = orig_to_roi[dst_orig]
-                # Add both directions (undirected graph)
+            # Both landmarks are in our ROI (all 468 landmarks)
+            src_roi = src_orig
+            dst_roi = dst_orig
+            
+            # Add both directions (undirected graph) if not already present
+            edge1 = (src_roi, dst_roi)
+            edge2 = (dst_roi, src_roi)
+            
+            if edge1 not in edge_set:
+                edge_set.add(edge1)
                 edges.append([src_roi, dst_roi])
+            
+            if edge2 not in edge_set:
+                edge_set.add(edge2)
                 edges.append([dst_roi, src_roi])
-        
-        # Add k-NN connections for any unconnected nodes
-        # This ensures full connectivity
-        roi_size = len(self.ROI_INDICES)
-        k = 5
-        
-        for i in range(roi_size):
-            for j in range(max(0, i - k), min(roi_size, i + k + 1)):
-                if i != j:
-                    # Check if edge already exists
-                    if [i, j] not in edges and [j, i] not in edges:
-                        edges.append([i, j])
-                        edges.append([j, i])
-        
-        if not edges:
-            # Fallback: complete graph
-            for i in range(roi_size):
-                for j in range(i + 1, roi_size):
-                    edges.append([i, j])
-                    edges.append([j, i])
         
         return np.array(edges).T if edges else np.zeros((2, 0), dtype=int)
     
@@ -603,26 +537,146 @@ class FaceMeshExtractor:
         logger.info(f"{'='*60}\n")
 
 
+def check_extraction_ready(dataset_root: Path, output_dir: Path) -> Tuple[bool, List[str]]:
+    """
+    Check if extraction can run successfully
+    
+    Args:
+        dataset_root: Path to dataset root
+        output_dir: Path to output directory
+        
+    Returns:
+        (is_ready, list_of_issues)
+    """
+    issues = []
+    
+    # Check dependencies
+    try:
+        import cv2
+        cv2_version = cv2.__version__
+        logger.info(f"✓ OpenCV: {cv2_version}")
+    except ImportError:
+        issues.append("OpenCV not installed. Install with: pip install opencv-python")
+    
+    try:
+        import mediapipe as mp
+        mp_version = mp.__version__
+        logger.info(f"✓ MediaPipe: {mp_version}")
+        
+        # Test MediaPipe FaceMesh initialization
+        try:
+            test_mesh = mp.solutions.face_mesh.FaceMesh(
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.3,
+                min_tracking_confidence=0.5
+            )
+            test_mesh.close()
+            logger.info("✓ MediaPipe FaceMesh initialization successful")
+        except Exception as e:
+            issues.append(f"MediaPipe FaceMesh initialization failed: {e}")
+    except ImportError:
+        issues.append("MediaPipe not installed. Install with: pip install mediapipe")
+    except Exception as e:
+        issues.append(f"MediaPipe error: {e}")
+    
+    try:
+        import torch
+        torch_version = torch.__version__
+        logger.info(f"✓ PyTorch: {torch_version}")
+    except ImportError:
+        issues.append("PyTorch not installed. Install with: pip install torch")
+    
+    # Check dataset directory
+    if not dataset_root.exists():
+        issues.append(f"Dataset directory not found: {dataset_root}")
+    else:
+        logger.info(f"✓ Dataset directory exists: {dataset_root}")
+        
+        # Check for at least one split
+        splits_found = []
+        for split in ['train', 'val', 'test']:
+            split_dir = dataset_root / split
+            if split_dir.exists():
+                splits_found.append(split)
+        
+        if not splits_found:
+            # Check for word directories with splits
+            word_dirs = [d for d in dataset_root.iterdir() if d.is_dir()]
+            if word_dirs:
+                # Check first word directory for splits
+                first_word = word_dirs[0]
+                for split in ['train', 'val', 'test']:
+                    if (first_word / split).exists():
+                        splits_found.append(split)
+                        break
+                
+                if splits_found:
+                    logger.info(f"✓ Found dataset structure with {len(word_dirs)} word directories")
+                else:
+                    issues.append(f"Dataset structure not found. Expected word directories with train/val/test subdirectories")
+            else:
+                issues.append(f"Dataset directory empty or incorrect structure")
+        else:
+            logger.info(f"✓ Found splits: {splits_found}")
+    
+    # Check output directory (can be created)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"✓ Output directory ready: {output_dir}")
+    except Exception as e:
+        issues.append(f"Cannot create output directory {output_dir}: {e}")
+    
+    # Check if already extracted
+    all_exist = True
+    for split in ['train', 'val', 'test']:
+        output_path = output_dir / f"{split}.pt"
+        if output_path.exists():
+            logger.info(f"⚠️  {split}.pt already exists (will be overwritten)")
+        else:
+            all_exist = False
+    
+    if all_exist:
+        logger.info("⚠️  All output files already exist. Extraction will overwrite them.")
+    
+    return len(issues) == 0, issues
+
+
 def main():
     """Main extraction pipeline"""
     project_root = Path(__file__).parent.parent.parent
     dataset_root = project_root / "data" / "IDLRW-DATASET"
-    output_dir = project_root / "data" / "processed_v2"  # Changed to processed_v2
-    
-    extractor = FaceMeshExtractor(num_workers=-1)
+    output_dir = project_root / "data" / "processed_v3"  # Changed to processed_v3
     
     logger.info(f"\n{'='*70}")
-    logger.info("FACE MESH EXTRACTION - IMPROVED VERSION")
+    logger.info("FACE MESH EXTRACTION - V3 (FULL FACE)")
     logger.info(f"{'='*70}")
     logger.info(f"Output directory: {output_dir}")
-    logger.info(f"Features: Extended landmarks (88), Temporal smoothing, Improved normalization")
+    logger.info(f"Features: All 468 landmarks (full face), MediaPipe default connections, Temporal smoothing")
     logger.info(f"{'='*70}\n")
+    
+    # Check if extraction can run
+    logger.info("🔍 Checking extraction readiness...")
+    is_ready, issues = check_extraction_ready(dataset_root, output_dir)
+    
+    if not is_ready:
+        logger.error("\n❌ Extraction cannot run. Issues found:")
+        for issue in issues:
+            logger.error(f"   - {issue}")
+        logger.error("\nPlease fix the issues above and try again.")
+        return False
+    
+    logger.info("\n✅ All checks passed! Starting extraction...\n")
+    
+    # Run extraction
+    extractor = FaceMeshExtractor(num_workers=-1)
     
     for split in ['train', 'val', 'test']:
         output_path = output_dir / f"{split}.pt"
         extractor.process_dataset(dataset_root, split, output_path)
     
     logger.info("✅ Extraction complete!")
+    return True
 
 
 if __name__ == "__main__":

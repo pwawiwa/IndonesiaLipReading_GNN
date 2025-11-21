@@ -574,12 +574,14 @@ def main():
         logger.info(f"🌐 Log dashboard available at http://{host}:{port}/ (auto-refresh every {refresh_minutes} min)")
     
     # Load data
+    use_advanced_features = config.get('use_advanced_features', False)
     train_loader, val_loader, test_loader, num_classes, label_map = create_dataloaders(
         train_pt=str(config['data_dir'] / 'train.pt'),
         val_pt=str(config['data_dir'] / 'val.pt'),
         test_pt=str(config['data_dir'] / 'test.pt'),
         batch_size=config['batch_size'],
-        num_workers=config['num_workers']
+        num_workers=config['num_workers'],
+        use_advanced_features=use_advanced_features
     )
     
     # Get input dim

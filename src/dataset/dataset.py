@@ -2,6 +2,7 @@
 src/dataset/dataset.py
 Enhanced dataset loader with advanced features (v5)
 Includes: Gabor filters, recurrence plots, FFT, multi-scale temporal, relative motion
+Updated for full face (468 landmarks) with MediaPipe FACEMESH_TESSELATION connections
 """
 import torch
 from torch.utils.data import Dataset
@@ -102,15 +103,22 @@ class LipReadingDataset(Dataset):
             # No acceleration: use zeros
             acceleration = torch.zeros((T, N, 3), dtype=landmarks.dtype)
         
-        # Use edge index from extractor if available, otherwise build k-NN
+        # Use edge index from extractor (MediaPipe FACEMESH_TESSELATION)
+        # Should always be present for full face (468 landmarks)
         if 'edge_index' in sample:
-            edge_index = sample['edge_index']  # [2, E] - anatomical edges from extractor
-            # Verify edge_index matches number of nodes
+            edge_index = sample['edge_index']  # [2, E] - MediaPipe FACEMESH_TESSELATION
+            # Verify edge_index is valid for current number of nodes
             if edge_index.max() >= N:
-                # If edge_index has more nodes than current sample, rebuild
-                edge_index = self._build_edge_index(N)
+                # Edge index has nodes beyond current sample - this shouldn't happen with full face
+                # But handle gracefully by filtering edges
+                mask = (edge_index[0] < N) & (edge_index[1] < N)
+                edge_index = edge_index[:, mask]
+                if edge_index.shape[1] == 0:
+                    # Fallback if no valid edges (shouldn't happen)
+                    edge_index = self._build_edge_index(N)
         else:
-            # Fallback: build k-NN edges if not in sample
+            # Fallback: build k-NN edges if edge_index missing (shouldn't happen with new extraction)
+            logger.warning(f"Sample {idx} missing edge_index, using fallback k-NN")
             edge_index = self._build_edge_index(N)
         
         # Create node features per timestep
@@ -438,11 +446,11 @@ class LipReadingDataset(Dataset):
     
     def _build_edge_index(self, num_nodes):
         """
-        Build edge index for graph
-        Simple k-NN in index space
+        Build edge index for graph (fallback only)
+        Simple k-NN in index space - only used if edge_index missing from sample
         
         Args:
-            num_nodes: Number of nodes
+            num_nodes: Number of nodes (should be 468 for full face)
             
         Returns:
             [2, E] edge index
@@ -464,7 +472,8 @@ class LipReadingDataset(Dataset):
 
 
 def create_dataloaders(train_pt: str, val_pt: str, test_pt: str, 
-                       batch_size: int = 32, num_workers: int = 4):
+                       batch_size: int = 32, num_workers: int = 4,
+                       use_advanced_features: bool = False):
     """
     Create dataloaders for train/val/test
     
@@ -474,17 +483,18 @@ def create_dataloaders(train_pt: str, val_pt: str, test_pt: str,
         test_pt: Path to test.pt
         batch_size: Batch size
         num_workers: DataLoader workers
+        use_advanced_features: Whether to use advanced features (Gabor, FFT, etc.)
         
     Returns:
         train_loader, val_loader, test_loader, num_classes, label_map
     """
     # Create datasets
-    train_dataset = LipReadingDataset(train_pt)
+    train_dataset = LipReadingDataset(train_pt, use_advanced_features=use_advanced_features)
     label_map = train_dataset.label_map
     num_classes = train_dataset.num_classes
     
-    val_dataset = LipReadingDataset(val_pt, label_map=label_map)
-    test_dataset = LipReadingDataset(test_pt, label_map=label_map)
+    val_dataset = LipReadingDataset(val_pt, label_map=label_map, use_advanced_features=use_advanced_features)
+    test_dataset = LipReadingDataset(test_pt, label_map=label_map, use_advanced_features=use_advanced_features)
     
     # Create loaders
     use_pin_memory = torch.cuda.is_available()

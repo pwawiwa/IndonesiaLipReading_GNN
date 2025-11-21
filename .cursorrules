@@ -1,0 +1,368 @@
+# ============================================
+#  CURSOR PROJECT RULES — Indonesia Lip Reading (GNN)
+#  FINAL (integrated with new requirements)
+#  Last update: <commit-id or date when applied>
+# ============================================
+
+# OVERVIEW
+# --------
+# This file is the canonical project rulebook. It MUST be followed for any
+# code, experiments, preprocessing, or results to be considered valid.
+# Changes to these rules must be versioned and approved; add a Git commit
+# message referencing the change. The goal is maximum reproducibility, low
+# storage footprint, deterministic evaluation, and clean experiment artifacts.
+
+# 0. GLOBAL PRINCIPLES
+# --------------------
+- Use PyTorch as the single ML framework. Store all feature/dataset artifacts in `.pt` format using `torch.save`.
+- Use float32 for tensors (minimum required precision). Avoid float64.
+- FPS is fixed to 25 for all preprocessing and feature calculations.
+- Use only ONE seed for the canonical experiment runs: seed = 0. (Pilot runs may use other seeds locally but must be noted.)
+- Use tmux for long-running scripts. Add small instructions in README for starting/stopping sessions.
+- Keep code modular, single-responsibility, well-documented, and tested.
+- All preprocessing is offline (extraction + FE) and saved. Models load precomputed artifacts.
+
+# 1. REPOSITORY & DIRECTORY LAYOUT (MANDATORY)
+# --------------------------------------------
+/project
+  /data
+    raw/                              # original videos (read-only)
+    IDLRW-DATASET/
+      <word>/
+        <split>/
+          <video>.mp4
+          <video>_meta.txt            # speech mask and meta (format below)
+  /extracted                           # outputs from facemesh_extractor
+    lips/
+      <vidid>.pt                       # saved dict: { 'frames': n, 'landmarks': tensor, 'fps':25, 'meta': {} }
+      example_checks/                   # generated images for node+adjacency checking
+    mouth_area/
+    full_face/
+  /features
+    B0/
+      <vidid>.pt
+    B1/
+    B2/
+    B3/
+    B4/
+  /graphs
+    lips/
+      adjacency.npy                     # numpy adjacency (saved for inspection), also saved in .pt artifact
+      node_map.json
+    mouth_area/
+    full_face/
+  /models
+    checkpoints/                        # saved via torch.save (state_dict + config)
+    configs/                            # *.yaml template configs (auto-tunable)
+  /results
+    <partition>/<FE>/<model>/<seed>/
+      run_meta.pt                       # dict: {metrics, hyperparams, seed, git_hash, timestamps}
+      metrics.pt                         # torch-saved dict of metrics per epoch
+      classification_report.pt
+      confusion_matrix.png
+      gradcam/                           # PNGs per sample + aggregated PNGs
+      loss_history.png
+  /scripts
+    run_extraction_all.sh
+    run_models_all.sh
+    generate_adjacency_check_images.sh
+  /logs
+    experiment_registry.pt              # master .pt dict that lists all runs and metadata
+  README.md
+  .cursorrules
+
+# 2. DATASET AND METADATA FORMAT
+# ------------------------------
+- Dataset root: `IDLRW-DATASET/<words>/<splits>/<video>.mp4` with accompanying `<video>_meta.txt`.
+- Required `video_meta.txt` structure (example content — these fields must exist):
+  VidID: <int>
+  VidName: <string>
+  ChannelId: <string or empty>
+  Start: <float_seconds>
+  End: <float_seconds>
+  Duration: <float_seconds>
+  SpeechMask: <frame-wise binary mask or run-length encoding>  # required field
+
+- SpeechMask specifics:
+  - Because FPS=25, frames correspond to integer indices at 25 fps.
+  - SpeechMask can be a compact textual format (e.g., "0-3,6,9-12") or a line with space-separated 0/1 values equal to number_of_frames.
+  - The extractor must parse this file and include a 'speech_mask' tensor in the extracted `.pt` artifact for every video.
+
+# 3. EXTRACTION RULES (facemesh_extractor.py)
+# -------------------------------------------
+- Single file: `facemesh_extractor.py`. Do NOT create duplicates.
+- CLI args:
+  --input-dir <raw dataset root>
+  --partition {lips,mouth,full}
+  --out-dir <project>/extracted/<partition>
+  --fps 25
+  --save-format pt
+- Extraction pipeline:
+  1. Load video at 25 FPS (resample if needed; log original fps in meta).
+  2. Run MediaPipe FaceMesh inference on every frame.
+  3. Apply per-frame filtering and smoothing (optional) deterministically.
+  4. Select nodes according to partition:
+     - full: use all 468 MediaPipe nodes and default adjacency topology.
+     - mouth_area: explicit subset (mouth + cheeks + chin nodes) with adjacency preserved between remaining nodes.
+     - lips: subset (inner+outer lips) with adjacency preserved among nodes.
+  5. Build adjacency matrix for the chosen node set by pruning the full-face topology while preserving anatomical edges (edge if both endpoints exist).
+  6. Node & adjacency CHECK:
+     - Save one representative sample image per X videos (configurable) showing:
+       - overlayed landmarks with node indices,
+       - drawn edges from adjacency,
+       - colored groups for AUs (if B4 grouping exists),
+       - speech mask overlay (frames where speech=1 highlighted).
+     - Save the image to `extracted/<partition>/example_checks/<vidid>_check.png`.
+     - Any mismatches (e.g., adjacency referencing missing node ids) must produce an error and stop the extraction for that partition.
+  7. Save `.pt` artifact per video in extracted/<partition>:
+     torch.save(dict(
+       vidid=int,
+       vidname=str,
+       fps=25,
+       frames=int,
+       landmarks=tensor(shape=(frames, n_nodes, 2), dtype=torch.float32),
+       adjacency=tensor(shape=(n_nodes, n_nodes), dtype=torch.float32) OR saved adjacency separately,
+       node_map=dict(face_idx -> node_idx),
+       speech_mask=tensor(shape=(frames,), dtype=torch.uint8),
+       meta=dict(start, end, duration, original_fps, extractor_version, git_hash)
+     ), out_path)
+  8. Extraction must be deterministic; set RNG seeds only for nondeterministic ops (if any) and log them.
+
+# 4. ADJACENCY & NODE CHECKING
+# ----------------------------
+- After extraction for each partition:
+  - Run `generate_adjacency_check_images.sh` which loads a random subset of extracted .pt artifacts and produces visual check images with:
+    - landmarks overlaid,
+    - adjacency edges drawn,
+    - node indices visible,
+    - AU-group colorings (if B4 AU mapping is defined),
+    - speech mask frames marked.
+- If any generated check image reveals disconnected nodes, duplicated indices, or mismatched adjacency references, the extractor must be fixed before running training.
+- Save a short text summary `extracted/<partition>/example_checks/report.txt` listing any warnings or confirmations.
+
+# 5. FEATURE ENGINEERING (B0–B4) — offline only
+# ---------------------------------------------
+- There are five FE levels:
+  B0: raw normalized coords (per-node X,Y)
+  B1: B0 + velocity (first derivative)
+  B2: B1 + acceleration (second derivative) + speed magnitude
+  B3: B2 + geometric features (pairwise distances for a small canonical set, angles, lip ratios)
+  B4: B3 + AU-like grouped displacement features (Action Unit inspired) + PCA modes + motion-energy features
+
+- Implementation rules:
+  - Use the pre-saved `extracted/<partition>/*.pt` artifacts to compute all B*.
+  - Save each resulting feature artifact to `/features/B*/<vidid>.pt` as a dict:
+    { 'vidid', 'features': tensor(frames, n_nodes, n_features), 'meta': {...} }
+  - All tensors must be float32.
+  - For B4: include a mapping `au_nodes` describing which node indices contributed to each AU group (store this in meta).
+- Normalization:
+  - Perform normalization during FE computation and save normalization params (mean/std or min/max) into the feature file meta (so evaluation uses the same normalization).
+  - Normalization strategy:
+    - Per-video per-node normalization: center coordinates by face bounding box center, scale by inter-ocular distance (or other stable facial measure). Save scaling factor in meta.
+    - Optionally, a global normalization (dataset mean/std) may be computed, but always save the parameters per-feature-set.
+- Storage rule: only `.pt` features are allowed. Do not write CSV for features.
+
+# 6. ACTION UNITS (AU) in B4
+# --------------------------
+- B4 must incorporate AU-inspired grouped features mindful of node selection:
+  - Define AU groups (e.g., AU25 lips part, AU26 jaw drop, AU12 lip corner pull, AU27 mouth stretch) mapped to node index sets for each partition.
+  - Compute group-level magnitudes per frame (e.g., mean absolute displacement for nodes in group).
+  - Include AU group tensors into the per-frame feature vector and store AU->node mapping in feature meta.
+- AU groups must be consistent across partitions (i.e., mapping defined in terms of MediaPipe base indices but pruned per partition via node_map).
+
+# 7. DATA LOADING & NORMALIZATION RULES
+# -------------------------------------
+- Training loaders must:
+  - Load `.pt` feature files and adjacency from `/features` and `/graphs`.
+  - Apply only lightweight runtime augmentations (if any): e.g., dropout on node features, small temporal jitter (documented).
+  - Use normalization params saved in feature meta — DO NOT recompute normalization at load time.
+- No heavy FE at load time.
+
+# 8. MODELS (allowed & forbidden)
+# -------------------------------
+- Allowed model types:
+  SPATIO-ONLY: GCN, GAT, GraphSAGE, GIN
+  TEMPORAL GNNS: ST-GCN, GConvLSTM
+  HYBRID: GNN→LSTM, GNN→GRU, GNN→BiGRU, GNN→TemporalConv1D
+
+- Forbidden:
+  - Transformers (all variants)
+  - TGAT, EvolveGCN (unless explicitly approved)
+  - Any model that constructs edges at runtime
+
+- All model code must accept adjacency and feature tensors as inputs, not construct adjacency.
+
+# 9. TRAINING ENTRYPOINT (train.py) & CONFIGS
+# -------------------------------------------
+- Single entrypoint `train.py` MUST exist. CLI args:
+  --partition {lips,mouth,full}
+  --featureset {B0,B1,B2,B3,B4}
+  --model <model_name>
+  --config <path/to/config.yaml>
+  --seed 0
+  --out-dir <path>
+
+- Config system:
+  - Use YAML config templates stored under `/models/configs/`.
+  - Config must include hyperparams (lr, batch_size, weight_decay), optimizer, scheduler, number of epochs, model-specific hyperparams, dataset paths, logging options, and early-stopping criteria.
+  - Config must be auto-tunable friendly (keys clearly named, numeric ranges suggested in comments).
+
+- Standardized training loop behaviors:
+  - Load feature `.pt`, adjacency, speech_mask (if needed for masking loss).
+  - Use deterministic dataloader settings for reproducibility (num_workers, pin_memory consistent).
+  - Log:
+    - epoch-level train/val loss, metrics
+    - time per epoch
+    - memory usage
+    - best model checkpoint saved as `best.pth` (state_dict + optimizer state + config + seed + git_hash + timestamp)
+    - final metrics saved as `.pt` dict and stored in results.
+  - After completion, run evaluation on test split and save classification_report and confusion_matrix as `.pt` (and PNG for confusion matrix).
+
+# 10. RUN SCRIPTS
+# ----------------
+- `scripts/run_extraction_all.sh`:
+  - loops partitions (lips,mouth,full)
+  - calls `facemesh_extractor.py` with seed=0, fps=25
+  - after extraction for a partition, invokes adjacency image checks
+- `scripts/run_models_all.sh`:
+  - reads list of models + FE sets + partitions from a YAML grid file
+  - launches `train.py` sequentially under tmux sessions or with GPU scheduling
+  - default single-seed (0) execution
+  - by checking availability of a file
+
+# 11. EXPERIMENTAL DESIGN — INCREMENTAL EXPERIMENT PURPOSE (B0–B4)
+# ----------------------------------------------------------------
+- B0 (Baseline): Can geometrical raw landmark coordinates alone separate visemes? Purpose: baseline spatial information.
+- B1 (Velocity): Tests whether dynamic motion (first derivative) improves separability beyond B0.
+- B2 (Accel + speed): Tests whether acceleration and speed magnitude add additional discriminative power (temporal dynamics).
+- B3 (Geometry): Tests whether explicit pairwise geometric relations (distances/angles/ratios) reduce viseme confusion that coords alone can't handle.
+- B4 (Full + AU): Tests if grouping into AU-like features and PCA motion modes captures higher-level articulatory patterns and improves robustness and interpretability.
+- Experimental rule: run full grid across partitions × B0..B4 × allowed models with seed=0 as canonical. Use pilot results to shortlist a small set for deeper analysis if necessary (but keep seed=0 as canonical for reproducibility/tracking).
+
+# 12. METRICS, LOGGING & RESULT STORAGE (NEATNESS)
+# ------------------------------------------------
+- All logs and metrics must be saved as `.pt` (torch-saved dicts) under `/results/<partition>/<FE>/<model>/<seed>/`.
+- Example run_meta.pt structure:
+  {
+    'vid': <id>,
+    'partition': 'lips',
+    'featureset': 'B2',
+    'model': 'gcn',
+    'seed': 0,
+    'git_hash': <commit>,
+    'hyperparams': {...},
+    'metrics': { 'best_val_acc': x, 'test_acc': y, 'f1_macro': z },
+    'time': { 'start': ts, 'end': ts, 'epoch_times': [...] },
+    'notes': '...'
+  }
+- Also save:
+  - confusion_matrix.png
+  - gradcam aggregated PNGs per-class
+  - loss_history.png
+- Maintain master experiment registry at `/logs/experiment_registry.pt` which is a dict of all runs and pointers to result folders. Update atomically after each finished run.
+
+# 13. TABLES / VISUALIZATIONS (per-model)
+# ---------------------------------------
+- For each model run:
+  - Generate and save:
+    - metrics.pt (per-epoch dict)
+    - classification_report.pt (per-class metrics)
+    - confusion_matrix.png
+    - gradcam/ PNGs (sample-level and aggregated)
+  - Additionally: create a compact per-run summary table (dictionary) and save as `.pt` for easy loading. Do not save CSVs for the canonical artifacts; saving a human-readable CSV is optional but discouraged. Preferred: if a tabular human-readable summary is needed, convert `.pt` to a one-off CSV via a utility script but keep canonical storage in `.pt`.
+
+# 14. DOCUMENTATION OF TRAIN RUNS
+# -------------------------------
+- Every run must produce a README-like `run_readme.txt` in the run folder summarizing:
+  - dataset version & path
+  - FE version & path
+  - adjacency path
+  - seed
+  - git commit hash
+  - config file path & contents
+  - quick human-readable result summary
+- This file must be automatically generated by `train.py` at the end of each run.
+
+# 15. REPRODUCIBILITY & MODULARITY
+# --------------------------------
+- All code must be modular:
+  - extractor module
+  - fe module
+  - graph utils module
+  - model modules
+  - training loop module
+  - utils (logging, plotting)
+- Tests: minimal unit tests for adjacency builder and feature computation must exist (can be simple smoke tests) and be run locally before large runs.
+
+# 16. TMUX & LONG-RUN INSTRUCTIONS
+# --------------------------------
+- Add small helper scripts in `/scripts` showing:
+  - `tmux new -s lipread` start
+  - `tmux attach -t lipread` attach
+  - `tmux kill-session -t lipread` stop
+- `run_models_all.sh` must be designed to be started inside a tmux session.
+
+# 17. STORAGE & SIZE RULES
+# ------------------------
+- Feature files (.pt) must be minimal (float32). Avoid duplication across partitions (do not store identical tensors for repeated content).
+- Model checkpoints can be pruned to only keep `best.pth` and optionally last.pth; older epoch checkpoints not required.
+- The experiment registry must be compact and not store entire tensors — only metadata and paths.
+
+# 18. ACKNOWLEDGE DATA LAYOUT (for cursor)
+# ----------------------------------------
+- Cursor (CI / automation) must be informed of data layout:
+  IDLRW-DATASET/<words>/<splits>/<video>.mp4 & <video_meta>.txt
+- Cursor must verify that each video_meta contains the fields in Section 2 and parse the SpeechMask into a frame-wise tensor matching FPS=25.
+- Example meta that must be parsed:
+  VidID: 0
+  VidName: matanajwa20212_100_125_4.mp4
+  ChannelId:
+  Start: 0.12 End: 0.88
+  Duration: 0.76 seconds
+  SpeechMask: 0 0 1 1 1 0 0  (or equivalent ranges)
+
+# 19. YAML CONFIG TEMPLATE & AUTO-TUNING
+# --------------------------------------
+- Provide one YAML template `models/configs/template.yaml` with placeholders and default ranges for:
+  - learning_rate: 1e-3
+  - batch_size: 32
+  - weight_decay: 1e-4
+  - model-specific params (hidden_dim, num_layers, dropout)
+  - training params (epochs, early_stop_patience)
+- Configs must be loadable and validated by the training script.
+- Optionally add comments in the YAML to guide auto-tuner tools (e.g., Optuna) for future tuning but do not require tuning by default.
+
+# 20. FINAL EXPERIMENT RULE (single-seed canonical)
+# -------------------------------------------------
+- The canonical published runs use seed=0 across the full grid (all partitions × B0..B4 × allowed models).
+- If additional seeds are needed for robustness, they must be run only for a small shortlisted set, and documented as non-canonical extensions.
+
+# 21. MAINTENANCE, UPDATES & APPROVAL
+# -----------------------------------
+- Any change to `.cursorrules` must be proposed via a PR and committed with a short justification.
+- The `extractor_version` and `git_hash` must be recorded in every saved artifact.
+
+# 22. FAILURE & RECOVERY
+# ----------------------
+- If an extraction run fails, the extractor must leave a `.failed` marker with logs and the failing frame index.
+- `run_extraction_all.sh` should skip `.failed` and continue but record failures into `extracted/<partition>/example_checks/report.txt`.
+
+# 23. QUICK CHECKLIST BEFORE LARGE RUN
+# -----------------------------------
+- [ ] dataset present and validated (cursor parse)
+- [ ] adjacency check images generated and validated
+- [ ] all partitions extracted without errors
+- [ ] features (B0..B4) computed and normalized; normalization meta saved
+- [ ] YAML configs prepared
+- [ ] tmux session available
+- [ ] disk capacity >= recommended size
+- [ ] experiment_registry accessible
+- [ ] seed set to 0 in scripts
+
+# 24. CONTACT / NOTES
+# -------------------
+- Add author and contact info in the README and within .cursorrules header when finalizing.
+
+# ============================================
+# End of .cursorrules
+# ============================================

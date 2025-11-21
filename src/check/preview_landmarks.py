@@ -1,6 +1,10 @@
 """
-Preview landmark connections from processed dataset
+Preview landmark connections from video file or processed dataset (processed_v3)
 Shows only landmarks and their connections (no real image background)
+
+Updated for processed_v3 with full face landmarks:
+- All 468 MediaPipe landmarks (full face)
+- Uses MediaPipe's default FACEMESH_TESSELATION connections (best topology)
 """
 import torch
 import numpy as np
@@ -8,12 +12,18 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Optional, List
 import argparse
+import sys
+
+# Add parent directory to path to import facemesh_extractor
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from preprocessing.facemesh_extractor import FaceMeshExtractor
 
 
 def visualize_landmark_connections(landmarks: torch.Tensor, edge_index: torch.Tensor, 
                                    frame_idx: int = 0, ax=None, title: str = ""):
     """
     Visualize landmark connections for a single frame
+    Optimized for comprehensive bottom face landmarks (processed_v3)
     
     Args:
         landmarks: [T, N, 3] tensor of landmarks
@@ -48,7 +58,7 @@ def visualize_landmark_connections(landmarks: torch.Tensor, edge_index: torch.Te
     x_padding = x_range * 0.1
     y_padding = y_range * 0.1
     
-    # Draw edges (connections)
+    # Draw edges (connections) - use thinner lines for better visibility with many landmarks
     edge_index_np = edge_index.numpy()
     for i in range(edge_index_np.shape[1]):
         src_idx = edge_index_np[0, i]
@@ -58,14 +68,16 @@ def visualize_landmark_connections(landmarks: torch.Tensor, edge_index: torch.Te
         if src_idx < len(x) and dst_idx < len(x):
             ax.plot([x[src_idx], x[dst_idx]], 
                    [y[src_idx], y[dst_idx]], 
-                   'b-', alpha=0.3, linewidth=0.5)
+                   'b-', alpha=0.2, linewidth=0.3, zorder=1)
     
-    # Draw landmarks (nodes)
-    ax.scatter(x, y, c='red', s=50, alpha=0.8, zorder=5)
+    # Draw landmarks (nodes) - smaller size for better visibility with many landmarks
+    ax.scatter(x, y, c='red', s=20, alpha=0.7, zorder=5, edgecolors='darkred', linewidths=0.5)
     
-    # Label some key landmarks (first few)
-    for i in range(min(10, len(x))):
-        ax.annotate(str(i), (x[i], y[i]), fontsize=6, alpha=0.6)
+    # Label key landmarks (first 20 for reference, but with smaller font)
+    num_labels = min(20, len(x))
+    for i in range(num_labels):
+        ax.annotate(str(i), (x[i], y[i]), fontsize=4, alpha=0.5, 
+                   bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.3, edgecolor='none'))
     
     ax.set_xlim(x_min - x_padding, x_max + x_padding)
     ax.set_ylim(y_min - y_padding, y_max + y_padding)
@@ -74,7 +86,7 @@ def visualize_landmark_connections(landmarks: torch.Tensor, edge_index: torch.Te
     ax.set_xlabel('X coordinate')
     ax.set_ylabel('Y coordinate')
     ax.set_title(title if title else f'Landmark Connections (Frame {frame_idx})')
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.2)
     
     return ax
 
@@ -133,6 +145,63 @@ def visualize_sequence(landmarks: torch.Tensor, edge_index: torch.Tensor,
     return fig
 
 
+def preview_from_video(video_path: str, output_dir: Path, num_frames: int = 5):
+    """
+    Preview landmark connections directly from a video file
+    Uses FaceMeshExtractor to extract landmarks with the same configuration
+    
+    Args:
+        video_path: Path to video file
+        output_dir: Output directory for saved images
+        num_frames: Number of frames to visualize
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    video_path = Path(video_path)
+    if not video_path.exists():
+        print(f"❌ Error: Video file not found: {video_path}")
+        return
+    
+    print(f"📹 Processing video: {video_path}")
+    print(f"   Using FaceMeshExtractor with comprehensive bottom face landmarks")
+    
+    # Initialize extractor (uses same ROI_INDICES and EDGE_PAIRS_ORIGINAL)
+    extractor = FaceMeshExtractor(num_workers=1)
+    
+    # Extract landmarks from video
+    print(f"   Extracting landmarks...")
+    result = extractor.extract_video(video_path, word=video_path.stem)
+    
+    if result is None:
+        print(f"❌ Error: Failed to extract landmarks from video")
+        return
+    
+    landmarks = result['landmarks']  # [T, N, 3]
+    edge_index = result['edge_index']  # [2, E]
+    video_id = result['video_id']
+    T = result['num_frames']
+    N = landmarks.shape[1]
+    
+    print(f"\n📊 Video: {video_id}")
+    print(f"   Sequence length: {T} frames")
+    print(f"   Landmarks per frame: {N} (full face - all 468 landmarks)")
+    print(f"   Edge connections: {edge_index.shape[1]} (MediaPipe FACEMESH_TESSELATION)")
+    
+    # Visualize sequence
+    fig = visualize_sequence(landmarks, edge_index, num_frames, video_id, video_path.stem)
+    
+    # Save figure
+    output_path = output_dir / f"landmarks_{video_id}.png"
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"   ✅ Saved: {output_path}")
+    plt.close(fig)
+    
+    print(f"\n{'='*60}")
+    print(f"✅ Preview complete! Saved to {output_path}")
+    print(f"{'='*60}\n")
+
+
 def preview_from_pt(pt_path: str, output_dir: Path, num_samples: int = 5, 
                    num_frames: int = 5, sample_indices: Optional[List[int]] = None):
     """
@@ -186,8 +255,8 @@ def preview_from_pt(pt_path: str, output_dir: Path, num_samples: int = 5,
         
         print(f"\n📊 Sample {idx}: {label} ({video_id})")
         print(f"   Sequence length: {T} frames")
-        print(f"   Landmarks per frame: {N}")
-        print(f"   Edge connections: {edge_index.shape[1]}")
+        print(f"   Landmarks per frame: {N} (full face - all 468 landmarks)")
+        print(f"   Edge connections: {edge_index.shape[1]} (MediaPipe FACEMESH_TESSELATION)")
         
         # Visualize sequence
         fig = visualize_sequence(landmarks, edge_index, num_frames, video_id, label)
@@ -204,27 +273,55 @@ def preview_from_pt(pt_path: str, output_dir: Path, num_samples: int = 5,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Preview landmark connections from processed dataset')
-    parser.add_argument('--pt_path', type=str, default='data/processed/train.pt',
-                       help='Path to processed .pt file')
+    parser = argparse.ArgumentParser(
+        description='Preview landmark connections from video or processed dataset (processed_v3)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Preview from a video file (direct extraction)
+  python src/check/preview_landmarks.py --video_path data/IDLRW-DATASET/word/train/video.mp4
+  
+  # Preview from processed_v3 train set
+  python src/check/preview_landmarks.py --pt_path data/processed_v3/train.pt
+  
+  # Preview from specific split
+  python src/check/preview_landmarks.py --pt_path data/processed_v3/val.pt
+  
+  # Preview specific samples from .pt file
+  python src/check/preview_landmarks.py --pt_path data/processed_v3/train.pt --sample_indices 0 1 2 3 4
+        """
+    )
+    parser.add_argument('--video_path', type=str, default=None,
+                       help='Path to video file (if provided, extracts landmarks directly)')
+    parser.add_argument('--pt_path', type=str, default='data/processed_v3/train.pt',
+                       help='Path to processed .pt file (default: data/processed_v3/train.pt)')
     parser.add_argument('--output_dir', type=str, default='outputs/landmark_previews',
                        help='Output directory for preview images')
     parser.add_argument('--num_samples', type=int, default=5,
-                       help='Number of samples to visualize')
+                       help='Number of samples to visualize (for .pt files)')
     parser.add_argument('--num_frames', type=int, default=5,
                        help='Number of frames per sample to visualize')
     parser.add_argument('--sample_indices', type=int, nargs='+', default=None,
-                       help='Specific sample indices to visualize (optional)')
+                       help='Specific sample indices to visualize (optional, for .pt files)')
     
     args = parser.parse_args()
     
-    preview_from_pt(
-        pt_path=args.pt_path,
-        output_dir=Path(args.output_dir),
-        num_samples=args.num_samples,
-        num_frames=args.num_frames,
-        sample_indices=args.sample_indices
-    )
+    # If video_path is provided, preview from video directly
+    if args.video_path:
+        preview_from_video(
+            video_path=args.video_path,
+            output_dir=Path(args.output_dir),
+            num_frames=args.num_frames
+        )
+    else:
+        # Otherwise, preview from .pt file
+        preview_from_pt(
+            pt_path=args.pt_path,
+            output_dir=Path(args.output_dir),
+            num_samples=args.num_samples,
+            num_frames=args.num_frames,
+            sample_indices=args.sample_indices
+        )
 
 
 if __name__ == "__main__":
