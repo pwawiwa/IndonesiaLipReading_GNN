@@ -1,0 +1,33 @@
+# GConvLSTM (Graph Convolutional LSTM) Model Configuration Template
+# Temporal GNN with integrated graph convolutions in LSTM cells
+
+data:
+  partition: lips  # lips, mouth, full
+  feature_level: B0  # B0, B1, B2, B3, B4
+  feature_dir: /home/member2/tomoooo/IndonesiaLipReading_GNN/features
+
+model:
+  name: gconvlstm
+  params:
+    # in_features and num_classes are auto-filled from data
+    hidden_dim: 128
+    num_layers: 1  # Number of stacked GConvLSTM layers (1-2 recommended)
+    dropout: 0.5
+    temporal_pool: last  # last, mean, max (last recommended for recurrent models)
+
+training:
+  output_dir: /home/member2/tomoooo/IndonesiaLipReading_GNN/results
+  batch_size: 16  # Smaller batch for recurrent models (memory intensive)
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: adam  # adam, adamw, sgd
+  
+  scheduler:
+    name: cosine  # cosine, steplr
+    step_size: 30
+    gamma: 0.1
+  
+  early_stopping_patience: 15
+  num_workers: null
+

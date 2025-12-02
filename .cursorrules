@@ -19,7 +19,7 @@
 - FPS is fixed to 25 for all preprocessing and feature calculations.
 - Use only ONE seed for the canonical experiment runs: seed = 0. (Pilot runs may use other seeds locally but must be noted.)
 - Use tmux for long-running scripts. Add small instructions in README for starting/stopping sessions.
-- Keep code modular, single-responsibility, well-documented, and tested.
+- Keep code modular, single-resp00onsibility, well-documented, and tested.
 - All preprocessing is offline (extraction + FE) and saved. Models load precomputed artifacts.
 
 # 1. REPOSITORY & DIRECTORY LAYOUT (MANDATORY)
@@ -32,25 +32,35 @@
         <split>/
           <video>.mp4
           <video>_meta.txt            # speech mask and meta (format below)
-  /extracted                           # outputs from facemesh_extractor
-    lips/
-      <vidid>.pt                       # saved dict: { 'frames': n, 'landmarks': tensor, 'fps':25, 'meta': {} }
-      example_checks/                   # generated images for node+adjacency checking
-    mouth_area/
-    full_face/
-  /features
+    extracted/
+    lips/train.pt
+    lips/val.pt
+    lips/test.pt
+    mouth_area/train.pt
+    full_face/train.pt
+    ...
+
+  features/
     B0/
-      <vidid>.pt
-    B1/
+      lips_train.pt
+      lips_val.pt
+      lips_test.pt
+      ...
     B2/
+      ...
     B3/
-    B4/
-  /graphs
-    lips/
-      adjacency.npy                     # numpy adjacency (saved for inspection), also saved in .pt artifact
-      node_map.json
-    mouth_area/
-    full_face/
+      ...
+    B3/         <-- contains AU features only (PCA and motion energy removed for memory optimization)
+      lips_train.pt
+      lips_val.pt
+      lips_test.pt
+      mouth_train.pt
+      mouth_val.pt
+      mouth_test.pt
+      full_train.pt
+      full_val.pt
+      full_test.pt
+    THIS IS THE IDEAL BUT WE WANT TO ITERATE WITH DELETING AFTER USING for example we compute landmarks, freatures & graph and then run the model for lips first, and then delete like freatures & Graph. and then proceed to mouth area and then do the same. THIS IS FOR STORAGE EFFICIENCY
   /models
     checkpoints/                        # saved via torch.save (state_dict + config)
     configs/                            # *.yaml template configs (auto-tunable)
@@ -63,9 +73,8 @@
       gradcam/                           # PNGs per sample + aggregated PNGs
       loss_history.png
   /scripts
-    run_extraction_all.sh
-    run_models_all.sh
-    generate_adjacency_check_images.sh
+    run_extraction.sh # lips, mouth_area, full_face
+    run_prepro_models_efficient.sh #r unning for extracted landmarks from run_extraction.sh to compute FE & do Modelling
   /logs
     experiment_registry.pt              # master .pt dict that lists all runs and metadata
   README.md
@@ -84,7 +93,7 @@
   SpeechMask: <frame-wise binary mask or run-length encoding>  # required field
 
 - SpeechMask specifics:
-  - Because FPS=25, frames correspond to integer indices at 25 fps.
+  - Because FPS=25, frames correspond to integer indices at 25 fps. for every video
   - SpeechMask can be a compact textual format (e.g., "0-3,6,9-12") or a line with space-separated 0/1 values equal to number_of_frames.
   - The extractor must parse this file and include a 'speech_mask' tensor in the extracted `.pt` artifact for every video.
 
@@ -99,72 +108,92 @@
   --save-format pt
 - Extraction pipeline:
   1. Load video at 25 FPS (resample if needed; log original fps in meta).
-  2. Run MediaPipe FaceMesh inference on every frame.
-  3. Apply per-frame filtering and smoothing (optional) deterministically.
-  4. Select nodes according to partition:
+  2. Extract and record video resolution (width, height) for normalization purposes.
+  3. Run MediaPipe FaceMesh inference on every frame.
+  4. Apply per-frame filtering and smoothing (optional) deterministically.
+  5. Select nodes according to partition:
      - full: use all 468 MediaPipe nodes and default adjacency topology.
      - mouth_area: explicit subset (mouth + cheeks + chin nodes) with adjacency preserved between remaining nodes.
      - lips: subset (inner+outer lips) with adjacency preserved among nodes.
-  5. Build adjacency matrix for the chosen node set by pruning the full-face topology while preserving anatomical edges (edge if both endpoints exist).
-  6. Node & adjacency CHECK:
+  6. Build adjacency matrix for the chosen node set by pruning the full-face topology while preserving anatomical edges (edge if both endpoints exist).
+  7. Node & adjacency CHECK:
      - Save one representative sample image per X videos (configurable) showing:
        - overlayed landmarks with node indices,
        - drawn edges from adjacency,
-       - colored groups for AUs (if B4 grouping exists),
+       - colored groups for AUs (if B3 grouping exists),
        - speech mask overlay (frames where speech=1 highlighted).
      - Save the image to `extracted/<partition>/example_checks/<vidid>_check.png`.
      - Any mismatches (e.g., adjacency referencing missing node ids) must produce an error and stop the extraction for that partition.
-  7. Save `.pt` artifact per video in extracted/<partition>:
-     torch.save(dict(
-       vidid=int,
-       vidname=str,
-       fps=25,
-       frames=int,
-       landmarks=tensor(shape=(frames, n_nodes, 2), dtype=torch.float32),
-       adjacency=tensor(shape=(n_nodes, n_nodes), dtype=torch.float32) OR saved adjacency separately,
-       node_map=dict(face_idx -> node_idx),
-       speech_mask=tensor(shape=(frames,), dtype=torch.uint8),
-       meta=dict(start, end, duration, original_fps, extractor_version, git_hash)
-     ), out_path)
-  8. Extraction must be deterministic; set RNG seeds only for nondeterministic ops (if any) and log them.
+  8. Aggregate and save `.pt` artifacts by split (train/val/test) in extracted/<partition>/:
+     - Process all videos for a given split, then save a single aggregated file: `<partition>_<split>.pt`
+     - Example: `extracted/lips/lips_train.pt`, `extracted/lips/lips_val.pt`, `extracted/lips/lips_test.pt`
+  9. Extraction must be deterministic; set RNG seeds only for nondeterministic ops (if any) and log them.
+  10. Resource management:
+      - Limit CPU usage to ~90% of available cores (leave ~10% free for system stability).
+      - Use `num_workers` or thread pool limits to control parallelism (e.g., `max_workers = max(1, int(os.cpu_count() * 0.9))`).
+      - For multiprocessing/threading operations, explicitly set worker counts to respect this limit.
+  11. Ensure the number of classes to be 100
 
 # 4. ADJACENCY & NODE CHECKING
 # ----------------------------
 - After extraction for each partition:
-  - Run `generate_adjacency_check_images.sh` which loads a random subset of extracted .pt artifacts and produces visual check images with:
+  - Run `generate_adjacency_check_images.sh` which loads a random subset of videos from the aggregated split files and produces visual check images with:
     - landmarks overlaid,
     - adjacency edges drawn,
     - node indices visible,
-    - AU-group colorings (if B4 AU mapping is defined),
+    - AU-group colorings (if B3 AU mapping is defined),
     - speech mask frames marked.
 - If any generated check image reveals disconnected nodes, duplicated indices, or mismatched adjacency references, the extractor must be fixed before running training.
 - Save a short text summary `extracted/<partition>/example_checks/report.txt` listing any warnings or confirmations.
 
-# 5. FEATURE ENGINEERING (B0–B4) — offline only
+# 5. FEATURE ENGINEERING (B0–B3) — offline only
 # ---------------------------------------------
-- There are five FE levels:
-  B0: raw normalized coords (per-node X,Y)
-  B1: B0 + velocity (first derivative)
-  B2: B1 + acceleration (second derivative) + speed magnitude
-  B3: B2 + geometric features (pairwise distances for a small canonical set, angles, lip ratios)
-  B4: B3 + AU-like grouped displacement features (Action Unit inspired) + PCA modes + motion-energy features
+- There are four FE levels (aggressive memory optimization applied):
+  B0: raw normalized coords (per-node X,Y) - 2 features
+  B1: velocity + speed (acceleration removed for memory optimization) - 3 features (vx, vy, speed)
+  B2: geometric features only (1 anchor distance + 1 angle) - 2 features
+  B3: AU-like grouped displacement features only (Action Unit inspired) - 4 features (AU25, AU26, AU12, AU27)
+  Note: Aggressive memory optimization - PCA and motion energy removed from B3, ratio removed and 1 anchor in B2. Total: 11 features per node (24 → 11, 54% reduction).
 
-- Implementation rules:
-  - Use the pre-saved `extracted/<partition>/*.pt` artifacts to compute all B*.
-  - Save each resulting feature artifact to `/features/B*/<vidid>.pt` as a dict:
-    { 'vidid', 'features': tensor(frames, n_nodes, n_features), 'meta': {...} }
+- IDEAL Implementation rules: # Because we want to delete after use
+  - Use the pre-saved aggregated `extracted/<partition>/<partition>_<split>.pt` files to compute all B*.
+  - Save aggregated feature artifacts by split to `/features/B*/<partition>_<split>.pt` as a dict:
+    {
+      'split': str,  # 'train', 'val', or 'test'
+      'adjacency': tensor(shape=(n_nodes, n_nodes), dtype=torch.float32),  # shared (can reference from extracted)
+      'videos': dict(  # keyed by vidid
+        <vidid>: dict(
+          vidid=int,
+          features=tensor(shape=(frames, n_nodes, n_features), dtype=torch.float32),
+          meta=dict(...)  # per-video normalization params, etc.
+        ),
+        ...
+      ),
+      'meta': dict(
+        featureset=str,  # 'B0', 'B1', 'B2', 'B3'
+        n_nodes=int,
+        n_features=int,
+        normalization_params=dict(...),  # global normalization params if applicable
+        au_nodes=dict(...)  # for B3: mapping of AU groups to node indices
+      )
+    }
   - All tensors must be float32.
-  - For B4: include a mapping `au_nodes` describing which node indices contributed to each AU group (store this in meta).
+  - For B3: include a mapping `au_nodes` in the top-level meta describing which node indices contributed to each AU group.
 - Normalization:
   - Perform normalization during FE computation and save normalization params (mean/std or min/max) into the feature file meta (so evaluation uses the same normalization).
   - Normalization strategy:
-    - Per-video per-node normalization: center coordinates by face bounding box center, scale by inter-ocular distance (or other stable facial measure). Save scaling factor in meta.
+    - Resolution-based normalization: Normalize landmark coordinates by video resolution (divide X by video_width, Y by video_height) to convert pixel coordinates to [0, 1] range. This handles different video resolutions uniformly.
+    - Per-video per-node normalization: After resolution normalization, center coordinates by face bounding box center, scale by inter-ocular distance (or other stable facial measure). Save scaling factor and resolution in meta.
     - Optionally, a global normalization (dataset mean/std) may be computed, but always save the parameters per-feature-set.
+  - Resource management:
+    - Limit CPU usage to ~90% of available cores (leave ~10% free for system stability).
+    - Use `num_workers` or thread pool limits to control parallelism (e.g., `max_workers = max(1, int(os.cpu_count() * 0.9))`).
+    - For multiprocessing/threading operations, explicitly set worker counts to respect this limit.
 - Storage rule: only `.pt` features are allowed. Do not write CSV for features.
 
-# 6. ACTION UNITS (AU) in B4
+# 6. ACTION UNITS (AU) in B3
 # --------------------------
-- B4 must incorporate AU-inspired grouped features mindful of node selection:
+- B3 must incorporate AU-inspired grouped features mindful of node selection:
   - Define AU groups (e.g., AU25 lips part, AU26 jaw drop, AU12 lip corner pull, AU27 mouth stretch) mapped to node index sets for each partition.
   - Compute group-level magnitudes per frame (e.g., mean absolute displacement for nodes in group).
   - Include AU group tensors into the per-frame feature vector and store AU->node mapping in feature meta.
@@ -173,7 +202,8 @@
 # 7. DATA LOADING & NORMALIZATION RULES
 # -------------------------------------
 - Training loaders must:
-  - Load `.pt` feature files and adjacency from `/features` and `/graphs`.
+  - Load aggregated `.pt` feature files from `/features/B*/<partition>_<split>.pt` (one file per split).
+  - Load adjacency matrix from the feature file (it's included in the aggregated structure).
   - Apply only lightweight runtime augmentations (if any): e.g., dropout on node features, small temporal jitter (documented).
   - Use normalization params saved in feature meta — DO NOT recompute normalization at load time.
 - No heavy FE at load time.
@@ -196,7 +226,7 @@
 # -------------------------------------------
 - Single entrypoint `train.py` MUST exist. CLI args:
   --partition {lips,mouth,full}
-  --featureset {B0,B1,B2,B3,B4}
+  --featureset {B0,B1,B2,B3}
   --model <model_name>
   --config <path/to/config.yaml>
   --seed 0
@@ -208,8 +238,12 @@
   - Config must be auto-tunable friendly (keys clearly named, numeric ranges suggested in comments).
 
 - Standardized training loop behaviors:
-  - Load feature `.pt`, adjacency, speech_mask (if needed for masking loss).
+  - Load aggregated feature `.pt` files (train/val/test splits), extract adjacency and features per video, and speech_mask (if needed for masking loss).
   - Use deterministic dataloader settings for reproducibility (num_workers, pin_memory consistent).
+  - Resource management:
+    - Limit CPU usage to ~90% of available cores (leave ~10% free for system stability).
+    - Set `num_workers` in DataLoader to `max(1, int(os.cpu_count() * 0.9))` to respect CPU limits.
+    - For training loops, ensure GPU operations don't block CPU unnecessarily.
   - Log:
     - epoch-level train/val loss, metrics
     - time per epoch
@@ -230,14 +264,14 @@
   - default single-seed (0) execution
   - by checking availability of a file
 
-# 11. EXPERIMENTAL DESIGN — INCREMENTAL EXPERIMENT PURPOSE (B0–B4)
+# 11. EXPERIMENTAL DESIGN — INCREMENTAL EXPERIMENT PURPOSE (B0–B3)
 # ----------------------------------------------------------------
-- B0 (Baseline): Can geometrical raw landmark coordinates alone separate visemes? Purpose: baseline spatial information.
-- B1 (Velocity): Tests whether dynamic motion (first derivative) improves separability beyond B0.
-- B2 (Accel + speed): Tests whether acceleration and speed magnitude add additional discriminative power (temporal dynamics).
-- B3 (Geometry): Tests whether explicit pairwise geometric relations (distances/angles/ratios) reduce viseme confusion that coords alone can't handle.
-- B4 (Full + AU): Tests if grouping into AU-like features and PCA motion modes captures higher-level articulatory patterns and improves robustness and interpretability.
-- Experimental rule: run full grid across partitions × B0..B4 × allowed models with seed=0 as canonical. Use pilot results to shortlist a small set for deeper analysis if necessary (but keep seed=0 as canonical for reproducibility/tracking).
+- B0 (Baseline): Can raw landmark coordinates alone separate visemes? Purpose: baseline spatial information (2 features).
+- B1 (Velocity + Speed): Tests whether dynamic motion (velocity and speed magnitude, acceleration removed) improves separability beyond B0 (3 features).
+- B2 (Geometry): Tests whether explicit pairwise geometric relations (1 anchor distance, angles) reduce viseme confusion (2 features).
+- B3 (AU Features): Tests if grouping into AU-like features (AU25, AU26, AU12, AU27) captures higher-level articulatory patterns (4 features).
+  Note: Aggressive memory optimization applied - PCA and motion energy removed from B3, ratio removed and 1 anchor in B2. Total: 11 features per node (54% reduction from original 24).
+- Experimental rule: run full grid across partitions × B0..B3 × allowed models with seed=0 as canonical. Use pilot results to shortlist a small set for deeper analysis if necessary (but keep seed=0 as canonical for reproducibility/tracking).
 
 # 12. METRICS, LOGGING & RESULT STORAGE (NEATNESS)
 # ------------------------------------------------
@@ -246,7 +280,7 @@
   {
     'vid': <id>,
     'partition': 'lips',
-    'featureset': 'B2',
+    'featureset': 'B1',
     'model': 'gcn',
     'seed': 0,
     'git_hash': <commit>,
@@ -304,7 +338,7 @@
 
 # 17. STORAGE & SIZE RULES
 # ------------------------
-- Feature files (.pt) must be minimal (float32). Avoid duplication across partitions (do not store identical tensors for repeated content).
+- Feature files (.pt) must be minimal (float32). Store aggregated by split (train/val/test) to avoid per-video file overhead. Avoid duplication across partitions (do not store identical tensors for repeated content).
 - Model checkpoints can be pruned to only keep `best.pth` and optionally last.pth; older epoch checkpoints not required.
 - The experiment registry must be compact and not store entire tensors — only metadata and paths.
 
@@ -334,7 +368,7 @@
 
 # 20. FINAL EXPERIMENT RULE (single-seed canonical)
 # -------------------------------------------------
-- The canonical published runs use seed=0 across the full grid (all partitions × B0..B4 × allowed models).
+- The canonical published runs use seed=0 across the full grid (all partitions × B0..B3 × allowed models).
 - If additional seeds are needed for robustness, they must be run only for a small shortlisted set, and documented as non-canonical extensions.
 
 # 21. MAINTENANCE, UPDATES & APPROVAL
@@ -352,7 +386,7 @@
 - [ ] dataset present and validated (cursor parse)
 - [ ] adjacency check images generated and validated
 - [ ] all partitions extracted without errors
-- [ ] features (B0..B4) computed and normalized; normalization meta saved
+- [ ] features (B0..B3) computed and normalized; normalization meta saved
 - [ ] YAML configs prepared
 - [ ] tmux session available
 - [ ] disk capacity >= recommended size

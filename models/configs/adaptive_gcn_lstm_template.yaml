@@ -1,0 +1,41 @@
+# Adaptive GCN LSTM Model Configuration Template
+# Hybrid Adaptive GCN-LSTM for Lip Reading
+# Combines learnable graph structure (Adaptive GCN) with temporal modeling (LSTM)
+
+data:
+  partition: full  # lips, mouth, full
+  feature_level: B0  # B0, B1, B2, B3
+  feature_dir: /home/member2/tomoooo/IndonesiaLipReading_GNN/features
+
+model:
+  name: adaptive_gcn_lstm
+  params:
+    # in_features and num_classes are auto-filled from data
+    # num_nodes must match partition: 468 for full, ~80 for mouth, ~40 for lips
+    num_nodes: 468  # Number of nodes (468 for full face, adjust for other partitions)
+    hidden_dim: 256
+    num_gcn_layers: 2  # Number of Adaptive GCN layers
+    num_lstm_layers: 1  # Number of LSTM layers
+    dropout: 0.5
+    bidirectional: false  # Use bidirectional LSTM
+    alpha: 0.5  # Weight for combining fixed and adaptive adjacency (0=only adaptive, 1=only fixed)
+
+training:
+  output_dir: /home/member2/tomoooo/IndonesiaLipReading_GNN/results
+  batch_size: 8  # Smaller batch for full partition (468 nodes)
+  epochs: 100
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  optimizer: adam  # adam, adamw, sgd
+  
+  # Optional: Learning rate scheduler
+  scheduler:
+    name: steplr  # steplr, cosine
+    step_size: 30
+    gamma: 0.1
+  
+  early_stopping_patience: 15
+  
+  # DataLoader settings
+  num_workers: null  # null = auto (0 for memory efficiency)
+

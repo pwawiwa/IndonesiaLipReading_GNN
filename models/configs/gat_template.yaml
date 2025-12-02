@@ -1,0 +1,34 @@
+# GAT Model Configuration Template
+# Graph Attention Network for Lip Reading
+
+data:
+  partition: lips  # lips, mouth, full
+  feature_level: B0  # B0, B1, B2, B3, B4
+  feature_dir: /home/member2/tomoooo/IndonesiaLipReading_GNN/features
+
+model:
+  name: gat
+  params:
+    # in_features and num_classes are auto-filled from data
+    hidden_dim: 64  # per head
+    num_layers: 2
+    num_heads: 4
+    dropout: 0.6
+    temporal_pool: mean
+
+training:
+  output_dir: /home/member2/tomoooo/IndonesiaLipReading_GNN/results
+  batch_size: 2  # Minimal batch size for GAT (processes frames and samples sequentially)
+  epochs: 100
+  learning_rate: 0.005
+  weight_decay: 0.0005
+  optimizer: adam
+  
+  scheduler:
+    name: steplr
+    step_size: 30
+    gamma: 0.1
+  
+  early_stopping_patience: 15
+  num_workers: null
+

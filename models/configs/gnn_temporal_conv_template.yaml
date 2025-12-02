@@ -1,0 +1,35 @@
+# GNN-TemporalConv1D Model Configuration Template
+# Hybrid GNN + 1D Temporal Convolution for Lip Reading
+
+data:
+  partition: lips  # lips, mouth, full
+  feature_level: B0  # B0, B1, B2, B3, B4
+  feature_dir: /home/member2/tomoooo/IndonesiaLipReading_GNN/features
+
+model:
+  name: gnn_temporal_conv
+  params:
+    # in_features and num_classes are auto-filled from data
+    hidden_dim: 128
+    num_gnn_layers: 2  # Number of GNN layers for spatial processing
+    num_temporal_layers: 2  # Number of temporal convolution layers
+    temporal_kernel_size: 3  # Kernel size for temporal convolutions (3, 5, 7)
+    dropout: 0.5
+    temporal_pool: mean  # mean, max, last
+
+training:
+  output_dir: /home/member2/tomoooo/IndonesiaLipReading_GNN/results
+  batch_size: 32
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: adam  # adam, adamw, sgd
+  
+  scheduler:
+    name: steplr  # steplr, cosine
+    step_size: 30
+    gamma: 0.1
+  
+  early_stopping_patience: 15
+  num_workers: null
+

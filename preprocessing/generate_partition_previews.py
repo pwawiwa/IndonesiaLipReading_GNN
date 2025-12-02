@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""
+Generate preview images for each partition showing:
+1. Graph structure (nodes + adjacency connections)
+2. Speech mask on/off states on sample frames
+"""
+import torch
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from pathlib import Path
+import argparse
+import sys
+from typing import Dict, Tuple
+
+sys.path.append(str(Path(__file__).parent.parent))
+from preprocessing.mediapipe_nodes import get_partition_nodes
+
+
+def load_extracted_data(pt_file: str) -> Dict:
+    """Load extracted .pt file."""
+    return torch.load(pt_file, weights_only=False)
+
+
+def visualize_graph_structure(
+    adjacency: torch.Tensor,
+    landmarks_sample: torch.Tensor,
+    partition: str,
+    output_path: str
+):
+    """
+    Visualize graph structure: nodes and connections.
+    
+    Args:
+        adjacency: Adjacency matrix (n_nodes, n_nodes)
+        landmarks_sample: Sample landmark coordinates (n_nodes, 2) normalized [0,1]
+        partition: Partition name
+        output_path: Path to save image
+    """
+    n_nodes = adjacency.shape[0]
+    
+    # Create figure
+    fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+    
+    # Convert normalized coords to display coordinates (assume square image)
+    # MediaPipe landmarks are normalized [0, 1]
+    coords = landmarks_sample.numpy()
+    
+    # Draw edges (connections)
+    edge_count = 0
+    for i in range(n_nodes):
+        for j in range(i + 1, n_nodes):
+            if adjacency[i, j] > 0.5:  # Edge exists
+                ax.plot([coords[i, 0], coords[j, 0]], 
+                       [coords[i, 1], coords[j, 1]], 
+                       'b-', alpha=0.3, linewidth=0.5)
+                edge_count += 1
+    
+    # Draw nodes
+    ax.scatter(coords[:, 0], coords[:, 1], 
+              c='red', s=50, alpha=0.8, edgecolors='black', linewidths=1)
+    
+    # Add node indices for small partitions
+    if n_nodes <= 100:
+        for i in range(n_nodes):
+            ax.annotate(str(i), (coords[i, 0], coords[i, 1]), 
+                       fontsize=6, ha='center', va='center',
+                       bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7))
+    
+    ax.set_xlim(-0.1, 1.1)
+    ax.set_ylim(1.1, -0.1)  # Invert Y axis (image coordinates)
+    ax.set_aspect('equal')
+    ax.set_title(f'{partition.upper()} Partition Graph Structure\n'
+                f'{n_nodes} nodes, {edge_count} edges', 
+                fontsize=14, fontweight='bold')
+    ax.set_xlabel('Normalized X coordinate', fontsize=10)
+    ax.set_ylabel('Normalized Y coordinate', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  ✓ Graph structure saved: {output_path}")
+
+
+def visualize_speech_mask_states(
+    video_path: str,
+    landmarks: torch.Tensor,
+    speech_mask: torch.Tensor,
+    adjacency: torch.Tensor,
+    partition: str,
+    output_path: str,
+    num_frames: int = 4
+):
+    """
+    Visualize sample frames with speech mask on/off states.
+    
+    Args:
+        video_path: Path to video file
+        landmarks: Landmark coordinates (frames, n_nodes, 2) normalized
+        speech_mask: Speech mask (frames,)
+        adjacency: Adjacency matrix (n_nodes, n_nodes)
+        partition: Partition name
+        output_path: Path to save image
+        num_frames: Number of frames to show
+    """
+    # Open video
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"  ⚠ Could not open video: {video_path}")
+        return
+    
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # Find frames with speech on and off
+    speech_frames = torch.where(speech_mask > 0.5)[0].tolist()
+    non_speech_frames = torch.where(speech_mask < 0.5)[0].tolist()
+    
+    # Select sample frames
+    frames_to_show = []
+    if speech_frames:
+        speech_samples = np.linspace(0, len(speech_frames) - 1, num_frames // 2, dtype=int)
+        frames_to_show.extend([speech_frames[i] for i in speech_samples])
+    if non_speech_frames:
+        non_speech_samples = np.linspace(0, len(non_speech_frames) - 1, num_frames // 2, dtype=int)
+        frames_to_show.extend([non_speech_frames[i] for i in non_speech_samples])
+    
+    # Limit to available frames
+    frames_to_show = [f for f in frames_to_show if f < landmarks.shape[0]][:num_frames]
+    
+    if not frames_to_show:
+        print(f"  ⚠ No valid frames found")
+        cap.release()
+        return
+    
+    # Create figure
+    cols = 2
+    rows = (len(frames_to_show) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(16, 8 * rows))
+    if rows == 1:
+        axes = axes.reshape(1, -1)
+    axes = axes.flatten()
+    
+    # Color scheme
+    partition_colors = {
+        'lips': (0, 255, 0),      # Green
+        'mouth': (255, 165, 0),   # Orange
+        'full': (255, 0, 255)     # Magenta
+    }
+    node_color = partition_colors.get(partition, (0, 255, 0))
+    
+    for plot_idx, frame_idx in enumerate(frames_to_show):
+        if plot_idx >= len(axes):
+            break
+        
+        # Read frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        
+        # Get landmarks for this frame
+        frame_landmarks = landmarks[frame_idx].numpy()
+        is_speech = speech_mask[frame_idx].item() > 0.5
+        
+        # Convert normalized coords to pixel coords
+        pixel_coords = frame_landmarks.copy()
+        pixel_coords[:, 0] = pixel_coords[:, 0] * width
+        pixel_coords[:, 1] = pixel_coords[:, 1] * height
+        pixel_coords = pixel_coords.astype(np.int32)
+        
+        # Create overlay
+        overlay = frame.copy()
+        
+        # Highlight speech frames with yellow tint
+        if is_speech:
+            overlay = cv2.addWeighted(overlay, 0.7, 
+                                   np.full_like(overlay, (0, 255, 255)), 0.3, 0)
+            mask_status = "SPEECH ON"
+            status_color = (0, 255, 0)  # Green
+        else:
+            mask_status = "SPEECH OFF"
+            status_color = (128, 128, 128)  # Gray
+        
+        # Draw edges (connections)
+        n_nodes = len(pixel_coords)
+        for i in range(n_nodes):
+            for j in range(i + 1, n_nodes):
+                if adjacency[i, j] > 0.5:  # Edge exists
+                    pt1 = tuple(pixel_coords[i])
+                    pt2 = tuple(pixel_coords[j])
+                    # Check if points are valid
+                    if (0 <= pt1[0] < width and 0 <= pt1[1] < height and
+                        0 <= pt2[0] < width and 0 <= pt2[1] < height):
+                        cv2.line(overlay, pt1, pt2, (100, 100, 255), 1)
+        
+        # Draw nodes
+        for node_idx, coord in enumerate(pixel_coords):
+            x, y = coord
+            if 0 <= x < width and 0 <= y < height:
+                # Draw node circle
+                cv2.circle(overlay, (x, y), 3, node_color, -1)
+                cv2.circle(overlay, (x, y), 3, (255, 255, 255), 1)
+        
+        # Convert BGR to RGB for matplotlib
+        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        
+        # Plot
+        ax = axes[plot_idx]
+        ax.imshow(overlay_rgb)
+        ax.set_title(f"Frame {frame_idx} - {mask_status}", 
+                    fontsize=12, fontweight='bold',
+                    color='green' if is_speech else 'gray')
+        ax.axis('off')
+    
+    # Hide unused subplots
+    for idx in range(len(frames_to_show), len(axes)):
+        axes[idx].axis('off')
+    
+    cap.release()
+    
+    plt.suptitle(f'{partition.upper()} Partition - Speech Mask Visualization', 
+                fontsize=16, fontweight='bold', y=0.995)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  ✓ Speech mask visualization saved: {output_path}")
+
+
+def generate_preview_for_partition(
+    partition: str,
+    extracted_dir: str = "data/extracted",
+    output_dir: str = None,
+    split: str = "train",
+    num_samples: int = 2
+):
+    """
+    Generate preview images for a partition.
+    
+    Args:
+        partition: Partition name (lips, mouth, full)
+        extracted_dir: Directory with extracted .pt files
+        output_dir: Output directory for previews (None = use extracted_dir)
+        split: Split to use (train, val, test)
+        num_samples: Number of sample videos to visualize
+    """
+    print("="*80)
+    print(f"GENERATING PREVIEWS FOR: {partition.upper()} PARTITION")
+    print("="*80)
+    
+    extracted_path = Path(extracted_dir) / partition / f"{partition}_{split}.pt"
+    
+    if not extracted_path.exists():
+        print(f"✗ Extracted file not found: {extracted_path}")
+        return
+    
+    # Load data
+    print(f"\nLoading: {extracted_path}")
+    data = load_extracted_data(str(extracted_path))
+    
+    adjacency = data['adjacency']
+    videos = data['videos']
+    n_nodes = data.get('n_nodes', adjacency.shape[0])
+    
+    print(f"  Nodes: {n_nodes}")
+    print(f"  Edges: {int((adjacency.sum() - adjacency.trace()).item()) // 2}")
+    print(f"  Videos: {len(videos)}")
+    
+    # Setup output directory
+    if output_dir is None:
+        output_dir = Path(extracted_dir) / partition / "previews"
+    else:
+        output_dir = Path(output_dir) / partition
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nOutput directory: {output_dir}")
+    
+    # 1. Visualize graph structure
+    print("\n[1/2] Generating graph structure visualization...")
+    
+    # Get sample landmarks (use first video, first frame)
+    sample_video_id = list(videos.keys())[0]
+    sample_video = videos[sample_video_id]
+    sample_landmarks = sample_video['landmarks'][0]  # First frame
+    
+    graph_output = output_dir / f"{partition}_graph_structure.png"
+    visualize_graph_structure(adjacency, sample_landmarks, partition, str(graph_output))
+    
+    # 2. Visualize speech mask states
+    print("\n[2/2] Generating speech mask visualization...")
+    
+    # Sample videos
+    video_ids = list(videos.keys())
+    sample_ids = np.random.choice(video_ids, min(num_samples, len(video_ids)), replace=False)
+    
+    for idx, video_id in enumerate(sample_ids, 1):
+        video_data = videos[video_id]
+        video_path = video_data.get('video_path')
+        
+        if not video_path or not Path(video_path).exists():
+            print(f"  ⚠ Video not found: {video_path}")
+            continue
+        
+        landmarks = video_data['landmarks']
+        speech_mask = video_data['speech_mask']
+        
+        mask_output = output_dir / f"{partition}_speech_mask_sample{idx}_{video_id}.png"
+        visualize_speech_mask_states(
+            video_path, landmarks, speech_mask, adjacency,
+            partition, str(mask_output)
+        )
+    
+    print("\n" + "="*80)
+    print(f"✓ PREVIEW GENERATION COMPLETE FOR {partition.upper()}")
+    print("="*80)
+    print(f"\nPreview images saved to: {output_dir}")
+    print(f"  - {partition}_graph_structure.png")
+    print(f"  - {partition}_speech_mask_sample*.png")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Generate partition preview images')
+    parser.add_argument('--partition', type=str, choices=['lips', 'mouth', 'full'],
+                       default=None, help='Partition to preview (default: all)')
+    parser.add_argument('--extracted-dir', type=str, default='data/extracted',
+                       help='Directory with extracted .pt files')
+    parser.add_argument('--output-dir', type=str, default=None,
+                       help='Output directory (default: extracted_dir/partition/previews)')
+    parser.add_argument('--split', type=str, default='train', choices=['train', 'val', 'test'],
+                       help='Split to use')
+    parser.add_argument('--num-samples', type=int, default=2,
+                       help='Number of sample videos for speech mask visualization')
+    
+    args = parser.parse_args()
+    
+    partitions = [args.partition] if args.partition else ['lips', 'mouth', 'full']
+    
+    for partition in partitions:
+        try:
+            generate_preview_for_partition(
+                partition=partition,
+                extracted_dir=args.extracted_dir,
+                output_dir=args.output_dir,
+                split=args.split,
+                num_samples=args.num_samples
+            )
+        except Exception as e:
+            print(f"\n✗ Error processing {partition}: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    print("\n" + "="*80)
+    print("ALL PREVIEWS GENERATED")
+    print("="*80)
+
+
+if __name__ == '__main__':
+    main()
+

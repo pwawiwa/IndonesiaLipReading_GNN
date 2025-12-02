@@ -1,76 +1,98 @@
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
-*.pyo
+*$py.class
 *.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
 
-# Virtual environments
-.venv/
-venv/
-idlrw-env/
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
 
-data
-# IDE/editor settings
+# PyTorch
+*.pth
+*.pt
+
+# Data directories (large files)
+data/extracted/
+data/features/
+data/IDLRW-DATASET/
+
+# Results and logs
+results/
+logs/
+*.log
+*.pid
+
+# Keep structure but ignore large files
+!data/extracted/.gitkeep
+!data/features/.gitkeep
+!results/.gitkeep
+!logs/.gitkeep
+
+# Generated configs (in results/)
+results/configs/
+
+# Sample/debug files (but keep important .txt files)
+*_sample_*.txt
+*_check.txt
+debug_*.txt
+test_*.txt
+
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
+.cursor/
 
-# OS junk
+# OS
 .DS_Store
 Thumbs.db
+__MACOSX/
+._*
 
-.python-version
-install-pyenv-win.ps1
-# Dataset and processed data
-data/IDLRW-DATASET/
-data/preprocessed/
-data/processed
-data/graphs
-data/features
-data
+# Temporary files
+tmp/
+temp/
+*.tmp
+nohup.out
+pipeline.log
+run*.log
 
-# Model checkpoints and weights
+# Environment
+.env
+.venv
+venv/
+env/
+ENV/
+
+# Model checkpoints and training artifacts
 *.pth
 *.pt
-*.ckpt
+checkpoints/
+wandb/
 
-# Logs, experiments, temp
-logs/
-*.log
-*.out
-*.err
-*.tmp
+# Visualization outputs (generated during training)
+loss_history.png
+confusion_matrix.png
+classification_report.png
+gradcam/
+node_importance/
 
-# Jupyter/IPython
-.ipynb_checkpoints/
-*.ipynb
+# Feature samples and debug outputs
+*_sample_*.txt
+*_check.png
+previews/
+example_checks/
 
-# Others
-*.zip
-*.tar.gz
-*.rar
+# PID files
+*.pid
 
-# Local reversible archive created during cleanup
-cleanup_archive/
-
-# Outputs and experiments (ignore most, but keep specific files)
-outputs/*
-!outputs/**/
-!outputs/**/training_curves_latest.png
-!outputs/**/classification_report*.txt
-
-# Reports (ignore most, but keep classification reports)
-reports/*
-!reports/**/
-!reports/classification_report*.txt
-
-
-archive
-docs
-
-DEBUGGING_ANALYSIS.md
-
-
-
-
+# Cursor specific
+.cursorrules.backup

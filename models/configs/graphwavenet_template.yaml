@@ -1,0 +1,33 @@
+# GraphWaveNet Model Configuration Template
+# GraphWaveNet combines dilated temporal convolutions with graph convolutions
+# for capturing long-range temporal dependencies and spatial graph structure
+
+data:
+  partition: lips
+  feature_level: B0
+  feature_dir: /home/member2/tomoooo/IndonesiaLipReading_GNN/features
+
+model:
+  name: graphwavenet
+  params:
+    # in_features and num_classes are auto-filled
+    hidden_dim: 64
+    num_blocks: 3  # Number of GraphWaveNet blocks (dilation: 1, 2, 4, ...)
+    kernel_size: 3  # Temporal kernel size
+    dropout: 0.5
+    temporal_pool: mean  # mean, max, or last
+
+training:
+  output_dir: /home/member2/tomoooo/IndonesiaLipReading_GNN/results
+  batch_size: 16  # Smaller batch for GraphWaveNet (memory intensive)
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: adam
+  
+  scheduler:
+    name: cosine
+  
+  early_stopping_patience: 15
+  num_workers: null
+
