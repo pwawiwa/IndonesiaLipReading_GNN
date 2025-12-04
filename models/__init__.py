@@ -17,6 +17,10 @@ from .graphsage_gru import GraphSAGEGRUModel
 from .graphsage_lstm import GraphSAGELSTMModel
 from .gnn_temporal_conv import GNNTemporalConvModel
 from .graphwavenet import GraphWaveNetModel
+from .gin_lstm_mamba import GINLSTMMambaModel
+from .gnn_lstm_mamba import GNNLSTMMambaModel
+from .graphsage_lstm_mamba import GraphSAGELSTMMambaModel
+from .adaptive_gcn_lstm_mamba import AdaptiveGCNLSTMMambaModel
 
 __all__ = [
     'BaseGNNModel',
@@ -36,6 +40,10 @@ __all__ = [
     'GraphSAGELSTMModel',
     'GNNTemporalConvModel',
     'GraphWaveNetModel',
+    'GINLSTMMambaModel',
+    'GNNLSTMMambaModel',
+    'GraphSAGELSTMMambaModel',
+    'AdaptiveGCNLSTMMambaModel',
 ]
 
 
@@ -67,6 +75,10 @@ def get_model(model_name: str, **kwargs):
         'graphsage_lstm': GraphSAGELSTMModel,
         'gnn_temporal_conv': GNNTemporalConvModel,
         'graphwavenet': GraphWaveNetModel,
+        'gin_lstm_mamba': GINLSTMMambaModel,
+        'gnn_lstm_mamba': GNNLSTMMambaModel,
+        'graphsage_lstm_mamba': GraphSAGELSTMMambaModel,
+        'adaptive_gcn_lstm_mamba': AdaptiveGCNLSTMMambaModel,
     }
     
     if model_name.lower() not in model_map:

@@ -263,10 +263,13 @@ class FaceMeshExtractor:
         results = []
         failed_count = 0
         
-        # Use sequential processing for 'full' partition to avoid ProcessPoolExecutor crashes
-        # with 468 nodes (high memory usage + MediaPipe GPU conflicts)
-        if self.partition == 'full':
-            self.logger.info("Using sequential processing for 'full' partition (468 nodes)")
+        # Use sequential processing for 'full' partition or when max_workers=1
+        # to avoid ProcessPoolExecutor crashes with MediaPipe GPU conflicts
+        if self.partition == 'full' or self.max_workers == 1:
+            if self.max_workers == 1:
+                self.logger.info("Using sequential processing (max_workers=1)")
+            else:
+                self.logger.info("Using sequential processing for 'full' partition (468 nodes)")
             for video_path in tqdm(video_files, desc=f"Extracting {split}"):
                 meta_path = video_path.with_suffix('.txt')
                 if meta_path.exists():
@@ -280,29 +283,29 @@ class FaceMeshExtractor:
                     failed_count += 1
         else:
             # Use parallel processing for lips/mouth partitions
-        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all tasks
-            futures = {}
-            for video_path in video_files:
-                meta_path = video_path.with_suffix('.txt')
-                if meta_path.exists():
-                    future = executor.submit(
-                        self.extract_video_landmarks,
-                        video_path,
-                        meta_path
-                    )
-                    futures[future] = video_path
-                else:
-                    self.logger.warning(f"Missing meta file: {meta_path}")
-                    failed_count += 1
-            
-            # Collect results with progress bar
-            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Extracting {split}"):
-                result = future.result()
-                if result is not None:
-                    results.append(result)
-                else:
-                    failed_count += 1
+            with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submit all tasks
+                futures = {}
+                for video_path in video_files:
+                    meta_path = video_path.with_suffix('.txt')
+                    if meta_path.exists():
+                        future = executor.submit(
+                            self.extract_video_landmarks,
+                            video_path,
+                            meta_path
+                        )
+                        futures[future] = video_path
+                    else:
+                        self.logger.warning(f"Missing meta file: {meta_path}")
+                        failed_count += 1
+                
+                # Collect results with progress bar
+                for future in tqdm(as_completed(futures), total=len(futures), desc=f"Extracting {split}"):
+                    result = future.result()
+                    if result is not None:
+                        results.append(result)
+                    else:
+                        failed_count += 1
         
         self.logger.info(f"Successfully extracted {len(results)} videos")
         if failed_count > 0:

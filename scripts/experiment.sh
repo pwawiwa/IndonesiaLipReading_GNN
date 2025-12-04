@@ -1,9 +1,10 @@
 #!/bin/bash
 # ============================================
-# Run All Scenarios: B0-B3 Features × Models
-# Full partition with aggressive memory optimization
-# Feature counts: B0=2, B1=3, B2=2, B3=4 (total 11 features per node, 54% reduction)
-# Models: GCN, GAT, GraphSAGE, GIN, ST-GCN, GConvLSTM, GNN-LSTM, GNN-GRU, GNN-TemporalConv1D, GraphWaveNet
+# BEST CONFIGURATION: Optimal hyperparameters for LSTM+Mamba models
+# - Batch size: 32, Hidden dim: 256, Epochs: 100
+# - 3 GNN layers, 3 LSTM layers, bidirectional, dropout 0.7
+# - Learning rate: 0.0005, Weight decay: 0.0001
+# - Scheduler: ReduceLROnPlateau (factor 0.7, patience 5)
 # ============================================
 
 set -e
@@ -17,29 +18,46 @@ RESULTS_DIR="${PROJECT_ROOT}/results"
 LOGS_DIR="${PROJECT_ROOT}/logs"
 DATASET_ROOT="${PROJECT_ROOT}/data/IDLRW-DATASET"
 
-PARTITION="full"
+PARTITION="mouth"  # Changed to mouth partition: inner+outer lips + jaw + cheeks
 SEED=0
 FPS=25
 
-# Target feature levels - will run for each level from B3 to B0
-# Feature counts: B0=2, B1=3 (vx,vy,speed), B2=2 (1 anchor+angle), B3=4 (AU only)
-# For B1 scenario only, set to: ("B1")
-TARGET_FEATURE_LEVELS=("B1")  # Run for B1 only
+# Target feature levels - will run for each level
+# CUMULATIVE FEATURE COUNTS (each file contains all previous levels):
+#   B0: 2 features (x, y)
+#   B1: 5 features (B0: 2 + B1: 3 = vx, vy, speed)
+#   B2: 7 features (B0: 2 + B1: 3 + B2: 2 = distance, angle)
+#   B3: 11 features (B0: 2 + B1: 3 + B2: 2 + B3: 4 = AU features)
+# Best model used B2 (geometric features), so we'll try both B1 and B2
+TARGET_FEATURE_LEVELS=("B1")  # Run for B1 and B2 feature levels (B2 was best for full partition)
 
-# Models for B1 scenario:
+# Models for mouth partition with B1 features:
 # - All LSTM models: gin_lstm, gnn_lstm, graphsage_lstm, adaptive_gcn_lstm
-# - Non-LSTM models: gin, gcn, graphsage, graphwavenet
-MODELS=("gin_lstm" "gnn_lstm" "graphsage_lstm" "adaptive_gcn_lstm")
+# - LSTM+Mamba hybrid models: gin_lstm_mamba, gnn_lstm_mamba, graphsage_lstm_mamba, adaptive_gcn_lstm_mamba
+# - Non-LSTM models: gin, gcn, graphsage, graphwavenet (can be added if needed)
+MODELS=("gin_lstm_mamba" "gnn_lstm_mamba" "graphsage_lstm_mamba" "adaptive_gcn_lstm_mamba")
 
 # Training hyperparameters
-# Reduced batch size for full partition (468 nodes) to avoid OOM
-BATCH_SIZE=32  # Reduced from 64 to 8 for memory efficiency
-HIDDEN_DIM=256
-NUM_EPOCHS=${EPOCHS:-50}  # Default 100, can be overridden by EPOCHS environment variable
+# BEST CONFIG: Optimal hyperparameters for best performance
+BATCH_SIZE=32  # Best config: optimal batch size
+HIDDEN_DIM=256  # Best config: optimal hidden dimension
+NUM_EPOCHS=${EPOCHS:-100}  # Best config: 100 epochs (can be overridden by EPOCHS env var)
 NUM_WORKERS=0  # Set to 0 to avoid memory duplication across workers
-LEARNING_RATE=0.0003  # Further reduced to combat severe overfitting
-WEIGHT_DECAY=0.001  # Increased 10x (0.0001 → 0.001) for stronger regularization
+LEARNING_RATE=0.0001  # Best config: matches best model (gin_lstm_mamba used 0.0001)
+WEIGHT_DECAY=0.0001   # Best config: matches best model (gin_lstm_mamba used 0.0001)
 GRADIENT_CLIP=1.0  # Gradient clipping to prevent exploding gradients
+
+# Speech mask scaling factor - test multiple values to find optimal
+# Controls how much speech_mask influences attention (higher = more influence)
+# Values to test: 0.5, 1.0, 2.0, 5.0, 10.0 (default: 5.0)
+# Set via env var: SPEECH_MASK_SCALE=10.0 ./scripts/experiment.sh
+SPEECH_MASK_SCALE=${SPEECH_MASK_SCALE:-10.0}  # Default: 5.0 (can override via env var)
+
+# Speech mask context - number of adjacent frames to include around speech_mask=1
+# If > 0, applies weight to +/- N frames around speech regions
+# Helps account for co-articulation and imperfect mask accuracy
+# Recommended: 1-3 frames (at 25 FPS: 1 frame = 40ms, 2 frames = 80ms, 3 frames = 120ms)
+SPEECH_MASK_CONTEXT=${SPEECH_MASK_CONTEXT:-1}  # Default: 1 frame (can override via env var)
 
 # Model-specific batch sizes (all models use batch size 8 for full partition)
 declare -A MODEL_BATCH_SIZES
@@ -133,19 +151,21 @@ ensure_prerequisites() {
     
     log "Ensuring prerequisites for ${target_level}..."
     
-    # Determine which levels are needed
+    # Determine which levels are needed for computation (cumulative approach)
+    # B1 needs B0 (to compute B0+B1), B2 needs B1 (to compute B0+B1+B2), etc.
+    # Each level file is cumulative, but computation requires previous levels
     case "${target_level}" in
         "B0")
             levels_needed=("B0")
             ;;
         "B1")
-            levels_needed=("B0" "B1")
+            levels_needed=("B0" "B1")  # B1 file contains B0+B1, but needs B0 to compute
             ;;
         "B2")
-            levels_needed=("B0" "B1" "B2")
+            levels_needed=("B0" "B1" "B2")  # B2 file contains B0+B1+B2, but needs B1 to compute
             ;;
         "B3")
-            levels_needed=("B0" "B1" "B2" "B3")
+            levels_needed=("B0" "B1" "B2" "B3")  # B3 file contains B0+B1+B2+B3, but needs B2 to compute
             ;;
         *)
             log "ERROR: Unknown feature level: ${target_level}"
@@ -153,7 +173,7 @@ ensure_prerequisites() {
             ;;
     esac
     
-    log "  Prerequisites needed: ${levels_needed[@]}"
+    log "  Prerequisites needed for computation: ${levels_needed[@]}"
     
     # Compute each level in order if it doesn't exist
     for level in "${levels_needed[@]}"; do
@@ -277,10 +297,40 @@ for split in splits_order:
         continue
     
     print(f"Processing {split} split sequentially...")
+    # OPTIMIZATION: Pass previous level feature paths for faster computation
+    # Each level now stores cumulative features (B1 has B0+B1, B2 has B0+B1+B2, etc.)
+    b0_features_path = None
+    b1_features_path = None
+    b2_features_path = None
+    
+    if '${feature_set}' == 'B1':
+        b0_features_path = output_base.parent / 'B0' / f'${PARTITION}_{split}.pt'
+        if not b0_features_path.exists():
+            b0_features_path = None
+    elif '${feature_set}' == 'B2':
+        b1_features_path = output_base.parent / 'B1' / f'${PARTITION}_{split}.pt'
+        if not b1_features_path.exists():
+            b1_features_path = None
+            # Fallback to B0 if B1 not available
+            b0_features_path = output_base.parent / 'B0' / f'${PARTITION}_{split}.pt'
+            if not b0_features_path.exists():
+                b0_features_path = None
+    elif '${feature_set}' == 'B3':
+        b2_features_path = output_base.parent / 'B2' / f'${PARTITION}_{split}.pt'
+        if not b2_features_path.exists():
+            b2_features_path = None
+            # Fallback to B0 if B2 not available
+            b0_features_path = output_base.parent / 'B0' / f'${PARTITION}_{split}.pt'
+            if not b0_features_path.exists():
+                b0_features_path = None
+    
     process_split_features(
         str(extracted_path),
         '${feature_set}',
-        str(output_path)
+        str(output_path),
+        b0_features_path=str(b0_features_path) if b0_features_path else None,
+        b1_features_path=str(b1_features_path) if b1_features_path else None,
+        b2_features_path=str(b2_features_path) if b2_features_path else None
     )
     print(f"✓ {split} complete")
 EOF
@@ -325,12 +375,12 @@ train_model() {
     local model_params=""
     case "${model_name}" in
         "gcn"|"gat"|"graphsage"|"gin")
-            model_params="    num_layers: 2
+            model_params="    num_layers: 3
     dropout: 0.5
     temporal_pool: max"
             if [ "${model_name}" = "gat" ]; then
                 model_params="${model_params}
-    num_heads: 4"
+    num_heads: 6"
             fi
             if [ "${model_name}" = "gin" ]; then
                 model_params="${model_params}
@@ -350,23 +400,24 @@ train_model() {
     temporal_pool: last"
             ;;
         "gnn_lstm"|"gnn_gru")
-            model_params="    num_gnn_layers: 2
+            model_params="    num_gnn_layers: 3
     dropout: 0.5"
             if [ "${model_name}" = "gnn_lstm" ]; then
                 # Use bidirectional LSTM for better temporal context
+                # Increased to 3 LSTM layers for deeper temporal modeling
                 model_params="${model_params}
-    num_lstm_layers: 1
+    num_lstm_layers: 3
     dropout: 0.7
     bidirectional: true"
             else
                 model_params="${model_params}
-    num_gru_layers: 1
+    num_gru_layers: 2
     bidirectional: false"
             fi
             ;;
         "gin_gru")
-            model_params="    num_gin_layers: 2
-    num_gru_layers: 1
+            model_params="    num_gin_layers: 3
+    num_gru_layers: 2
     dropout: 0.5
     bidirectional: false
     eps: 0.0
@@ -376,30 +427,32 @@ train_model() {
             # Use bidirectional LSTM for better temporal context
             # Bidirectional processes frames in both directions (forward + backward)
             # This improves lip reading by capturing co-articulation patterns
-            model_params="    num_gin_layers: 2
-    num_lstm_layers: 1
+            # Increased to 3 LSTM layers for deeper temporal modeling
+            model_params="    num_gin_layers: 3
+    num_lstm_layers: 3
     dropout: 0.7
     bidirectional: true
     eps: 0.0
     train_eps: false"
             ;;
         "graphsage_gru")
-            model_params="    num_sage_layers: 2
-    num_gru_layers: 1
+            model_params="    num_sage_layers: 3
+    num_gru_layers: 2
     dropout: 0.5
     bidirectional: false
     aggregator: mean"
             ;;
         "graphsage_lstm")
             # Use bidirectional LSTM for better temporal context
-            model_params="    num_sage_layers: 2
-    num_lstm_layers: 1
+            # Increased to 3 LSTM layers for deeper temporal modeling
+            model_params="    num_sage_layers: 3
+    num_lstm_layers: 3
     dropout: 0.7
     bidirectional: true
     aggregator: mean"
             ;;
         "gnn_temporal_conv")
-            model_params="    num_gnn_layers: 2
+            model_params="    num_gnn_layers: 3
     num_temporal_layers: 2
     temporal_kernel_size: 3
     dropout: 0.5
@@ -414,15 +467,69 @@ train_model() {
         "adaptive_gcn_lstm")
             # Use bidirectional LSTM for better temporal context
             # Combines adaptive graph learning with bidirectional temporal modeling
-            model_params="    num_gcn_layers: 2
-    num_lstm_layers: 1
+            # Increased to 3 LSTM layers for deeper temporal modeling
+            model_params="    num_gcn_layers: 3
+    num_lstm_layers: 3
     dropout: 0.7
     bidirectional: true
     alpha: 0.5"
             ;;
+        "gin_lstm_mamba"|"gnn_lstm_mamba"|"graphsage_lstm_mamba"|"adaptive_gcn_lstm_mamba")
+            # LSTM+Mamba hybrid: Sequential architecture (LSTM → Mamba)
+            # ALL MODELS NOW USE IDENTICAL CONFIG (matching GIN)
+            # - Temporal attention + speech mask (learnable attention with prior guidance)
+            # - Layer normalization + residual connections
+            # - Same dropout, layers, and hyperparameters
+            # - Only model-specific params differ (eps for GIN, aggregator for GraphSAGE, alpha for Adaptive GCN)
+            if [ "${model_name}" = "gin_lstm_mamba" ]; then
+                model_params="    num_gin_layers: 2
+    num_lstm_layers: 1
+    dropout: 0.5  # Best config: matches best model (gin_lstm_mamba used 0.5)
+    bidirectional: true
+    eps: 0.0
+    train_eps: false
+    mamba_d_state: 16
+    mamba_d_conv: 4
+    mamba_expand: 2
+    speech_mask_scale: ${SPEECH_MASK_SCALE}  # Speech mask scaling factor (test: 0.5, 1.0, 2.0, 5.0, 10.0)
+    speech_mask_context: ${SPEECH_MASK_CONTEXT}  # Adjacent frames to include (0=exact, 1-3=context)"
+            elif [ "${model_name}" = "gnn_lstm_mamba" ]; then
+                model_params="    num_gnn_layers: 2
+    num_lstm_layers: 1
+    dropout: 0.5  # Best config: matches best model (same as gin_lstm_mamba)
+    bidirectional: true
+    mamba_d_state: 16
+    mamba_d_conv: 4
+    mamba_expand: 2
+    speech_mask_scale: ${SPEECH_MASK_SCALE}  # Speech mask scaling factor (test: 0.5, 1.0, 2.0, 5.0, 10.0)
+    speech_mask_context: ${SPEECH_MASK_CONTEXT}  # Adjacent frames to include (0=exact, 1-3=context)"
+            elif [ "${model_name}" = "graphsage_lstm_mamba" ]; then
+                model_params="    num_sage_layers: 2
+    num_lstm_layers: 1
+    dropout: 0.5  # Best config: matches best model (same as gin_lstm_mamba)
+    bidirectional: true
+    aggregator: mean
+    mamba_d_state: 16
+    mamba_d_conv: 4
+    mamba_expand: 2
+    speech_mask_scale: ${SPEECH_MASK_SCALE}  # Speech mask scaling factor (test: 0.5, 1.0, 2.0, 5.0, 10.0)
+    speech_mask_context: ${SPEECH_MASK_CONTEXT}  # Adjacent frames to include (0=exact, 1-3=context)"
+            elif [ "${model_name}" = "adaptive_gcn_lstm_mamba" ]; then
+                model_params="    num_gcn_layers: 2
+    num_lstm_layers: 1
+    dropout: 0.5  # Best config: matches best model (same as gin_lstm_mamba)
+    bidirectional: true
+    alpha: 0.5
+    mamba_d_state: 16
+    mamba_d_conv: 4
+    mamba_expand: 2
+    speech_mask_scale: ${SPEECH_MASK_SCALE}  # Speech mask scaling factor (test: 0.5, 1.0, 2.0, 5.0, 10.0)
+    speech_mask_context: ${SPEECH_MASK_CONTEXT}  # Adjacent frames to include (0=exact, 1-3=context)"
+            fi
+            ;;
         *)
             # Default parameters
-            model_params="    num_layers: 2
+            model_params="    num_layers: 3
     dropout: 0.5
     temporal_pool: max"
             ;;
@@ -448,12 +555,14 @@ training:
   weight_decay: ${WEIGHT_DECAY}
   optimizer: adam
   scheduler:
-    name: steplr
-    step_size: 30
-    gamma: 0.1
-  early_stopping_patience: 10
+    name: reduceonplateau  # Best config: matches best model (gin_lstm_mamba used reduceonplateau)
+    mode: min
+    factor: 0.7
+    patience: 5
+    min_lr: 1e-6
+  early_stopping_patience: 25  # Best config: matches best model (gin_lstm_mamba used 10)
   gradient_clip: ${GRADIENT_CLIP}
-  label_smoothing: 0.1
+  label_smoothing: 0.0  # Best config: matches best model (gin_lstm_mamba used 0.0)
   num_workers: ${NUM_WORKERS}
 EOF
     
@@ -514,15 +623,16 @@ cleanup_features() {
 # ===================
 
 log "="*80
-log "ALL SCENARIOS PIPELINE - FULL PARTITION"
+log "ALL SCENARIOS PIPELINE - MOUTH PARTITION (BIGGER MODELS)"
 log "="*80
-log "Partition: ${PARTITION}"
+log "Partition: ${PARTITION} (inner+outer lips + jaw + cheeks)"
 log "Target feature levels: ${TARGET_FEATURE_LEVELS[@]}"
 log "Models: ${MODELS[@]}"
 log "Total scenarios: $((${#MODELS[@]} * ${#TARGET_FEATURE_LEVELS[@]}))"
+log "Model capacity: HIDDEN_DIM=${HIDDEN_DIM} (doubled from best config), BATCH_SIZE=${BATCH_SIZE}, increased layers (3 GIN/GCN, 2 LSTM/GRU)"
 log "Processing: Will preprocess prerequisites for each level if needed"
-log "Training: Will load incrementally (B0 + B1 + ... + TARGET_FEATURE_LEVEL)"
-log "Feature counts: B0=2, B1=3, B2=2, B3=4 (total 11 features per node, 54% reduction)"
+log "Training: Each B level file contains cumulative features (no concatenation needed)"
+log "Cumulative feature counts: B0=2, B1=5 (B0+B1), B2=7 (B0+B1+B2), B3=11 (B0+B1+B2+B3)"
 log "Memory optimization: Acceleration removed from B1, 1 anchor+no ratio in B2, PCA/motion removed from B3"
 log "="*80
 
@@ -559,7 +669,7 @@ for TARGET_FEATURE_LEVEL in "${TARGET_FEATURE_LEVELS[@]}"; do
     fi
     
     # Process each model with the target feature level
-    # Incremental loading will automatically load B0 + B1 + ... + TARGET_FEATURE_LEVEL
+    # Each B level file contains cumulative features (B1 has B0+B1, B2 has B0+B1+B2, etc.)
     for model_name in "${MODELS[@]}"; do
         log ""
         log "="*80
@@ -573,19 +683,19 @@ for TARGET_FEATURE_LEVEL in "${TARGET_FEATURE_LEVELS[@]}"; do
             continue
         fi
         
-        # Train model with target feature level (will load incrementally: B0+B1+...+TARGET)
+        # Train model with target feature level (cumulative file contains all features up to that level)
         log "  Training ${model_name} with ${TARGET_FEATURE_LEVEL}..."
-        log "  Note: Data loader will load incrementally: B0 + B1 + ... + ${TARGET_FEATURE_LEVEL}"
+        log "  Note: ${TARGET_FEATURE_LEVEL} file contains cumulative features (all previous levels included)"
         
-        # Calculate total features for this level
+        # Calculate total features for this level (cumulative)
         case "${TARGET_FEATURE_LEVEL}" in
             "B0") total_features=2 ;;
-            "B1") total_features=5 ;;
-            "B2") total_features=7 ;;
-            "B3") total_features=11 ;;
+            "B1") total_features=5 ;;  # B0(2) + B1(3)
+            "B2") total_features=7 ;;  # B0(2) + B1(3) + B2(2)
+            "B3") total_features=11 ;; # B0(2) + B1(3) + B2(2) + B3(4)
             *) total_features="unknown" ;;
         esac
-        log "  Feature counts: B0=2, B1=3, B2=2, B3=4 (total ${total_features} features per node for ${TARGET_FEATURE_LEVEL})"
+        log "  Cumulative feature count: ${total_features} features per node (${TARGET_FEATURE_LEVEL} file is self-contained)"
         
         train_model "${TARGET_FEATURE_LEVEL}" "${model_name}"
         

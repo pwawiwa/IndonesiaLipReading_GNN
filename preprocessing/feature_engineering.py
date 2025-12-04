@@ -1,22 +1,23 @@
 """
 Feature Engineering: B0 - B3 feature sets.
 
-Each level stores ONLY its incremental features (non-overlapping):
+Each level stores CUMULATIVE features (includes all previous levels):
 - B0: Raw normalized coordinates (X, Y per node) - 2 features
-- B1: Velocity + speed - 3 features (vx, vy, speed) - acceleration removed for memory optimization
-- B2: Geometric features only (distances, angles) - 2 features (1 distance + 1 angle)
-  Note: Ratio removed and reduced to 1 anchor for memory optimization
-- B3: AU-like features only - 4 features (4 AU: AU25, AU26, AU12, AU27)
-  Note: Aggressive memory optimization - PCA and motion energy removed, only AU features kept
+- B1: B0 + Velocity + speed - 5 features (B0: 2 + B1: 3 = 5 total)
+- B2: B0 + B1 + Geometric features - 7 features (B0: 2 + B1: 3 + B2: 2 = 7 total)
+  Note: Geometric features: 1 distance + 1 angle (ratio removed for memory optimization)
+- B3: B0 + B1 + B2 + AU features - 11 features (B0: 2 + B1: 3 + B2: 2 + B3: 4 = 11 total)
+  Note: AU features: 4 AU groups (AU25, AU26, AU12, AU27). PCA and motion energy removed.
 
-When loading for training, features are concatenated: B0+B1+B2+B3
-This ensures no duplication and minimal storage footprint.
+When loading for training, just load the target level file (no concatenation needed).
+Each file is self-contained with all features up to that level.
 """
 import torch
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from sklearn.decomposition import PCA
 import math
+from tqdm import tqdm
 
 
 class FeatureEngineer:
@@ -153,7 +154,7 @@ class FeatureEngineer:
     
     def compute_B1(self, landmarks: torch.Tensor, meta: Dict) -> torch.Tensor:
         """
-        B1: Returns velocity + speed (incremental, non-overlapping with B0).
+        B1: Returns B0 + velocity + speed (cumulative, includes B0).
         Acceleration removed for memory optimization.
         
         Args:
@@ -161,7 +162,7 @@ class FeatureEngineer:
             meta: Video metadata
             
         Returns:
-            Features of shape (frames, n_nodes, 3)  [vx, vy, speed] - velocity + speed (no acceleration)
+            Features of shape (frames, n_nodes, 5)  [B0: x, y] + [B1: vx, vy, speed]
         """
         # B0 features (needed for velocity computation)
         b0 = self.compute_B0(landmarks, meta)
@@ -172,35 +173,54 @@ class FeatureEngineer:
         # Speed magnitude
         speed = self.compute_speed(velocity)
         
-        # Return velocity + speed (acceleration removed for memory optimization)
-        features = torch.cat([velocity, speed], dim=-1)
+        # Return B0 + velocity + speed (cumulative: B0 + B1)
+        b1_features = torch.cat([velocity, speed], dim=-1)  # (frames, n_nodes, 3)
+        features = torch.cat([b0, b1_features], dim=-1)  # (frames, n_nodes, 5)
         
         return features
     
-    def compute_B2(self, landmarks: torch.Tensor, meta: Dict, partition: str) -> torch.Tensor:
+    def compute_B2(self, landmarks: torch.Tensor, meta: Dict, partition: str, b0_coords: Optional[torch.Tensor] = None, b1_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        B2: Returns ONLY geometric features (incremental, non-overlapping with B0/B1).
+        B2: Returns B0 + B1 + geometric features (cumulative, includes B0+B1).
         
         Args:
-            landmarks: Shape (frames, n_nodes, 2)
+            landmarks: Shape (frames, n_nodes, 2) - raw landmarks (used if b0_coords not provided)
             meta: Video metadata
             partition: 'lips', 'mouth', or 'full'
+            b0_coords: Optional pre-computed B0 coordinates (faster, avoids recomputation)
+            b1_features: Optional pre-computed B1 features (B0+B1, faster, avoids recomputation)
             
         Returns:
-            Geometric features ONLY (incremental features for B2)
+            Features of shape (frames, n_nodes, 7)  [B0: x, y] + [B1: vx, vy, speed] + [B2: distance, angle]
         """
-        # B0 coords for geometric computation
-        b0 = self.compute_B0(landmarks, meta)
+        # OPTIMIZATION: Use existing B0+B1 if provided (much faster)
+        if b1_features is not None:
+            b0_b1 = b1_features  # Already has B0+B1
+            b0 = b1_features[:, :, :2]  # Extract B0 for geometric computation
+        else:
+            # Compute B0
+            if b0_coords is not None:
+                b0 = b0_coords
+            else:
+                b0 = self.compute_B0(landmarks, meta)
+            
+            # Compute B1 (B0 + velocity + speed)
+            b1 = self.compute_B1(landmarks, meta)  # Returns B0+B1
+            b0_b1 = b1
         
-        # Geometric features ONLY (incremental feature for B2)
+        # Geometric features (B2 incremental)
         geom = self.compute_geometric_features(b0, partition)
         
-        return geom
+        # Return B0 + B1 + B2 (cumulative)
+        features = torch.cat([b0_b1, geom], dim=-1)  # (frames, n_nodes, 7)
+        
+        return features
     
     def compute_geometric_features(
         self,
         coords: torch.Tensor,
-        partition: str
+        partition: str,
+        anchor_idx: Optional[int] = None
     ) -> torch.Tensor:
         """
         Compute geometric features: pairwise distances, angles, ratios.
@@ -209,6 +229,7 @@ class FeatureEngineer:
         Args:
             coords: Shape (frames, n_nodes, 2)
             partition: 'lips', 'mouth', or 'full'
+            anchor_idx: Pre-computed anchor index (optional, for optimization)
             
         Returns:
             Geometric features of shape (frames, n_nodes, n_geom_features)
@@ -219,29 +240,28 @@ class FeatureEngineer:
         
         # 1. Pairwise distances to anchor nodes (vectorized)
         # Reduced to 1 anchor for memory optimization
-        # For full partition: use nose tip (MediaPipe landmark 4, remapped index 4) - stable central reference
-        # For lips/mouth partitions: use node 0 (nose tip not available)
-        from preprocessing.mediapipe_nodes import get_partition_nodes
-        
-        nodes = get_partition_nodes(partition)
-        nose_tip_mp = 4  # MediaPipe nose tip landmark
-        
-        if partition == 'full' and nose_tip_mp in nodes:
-            # Use nose tip as anchor for full partition (more stable, central reference)
-            anchor_remapped_idx = nodes.index(nose_tip_mp)
+        # OPTIMIZATION: Compute anchor index once if not provided
+        if anchor_idx is None:
+            from preprocessing.mediapipe_nodes import get_partition_nodes
+            nodes = get_partition_nodes(partition)
+            nose_tip_mp = 4  # MediaPipe nose tip landmark
+            
+            if partition == 'full' and nose_tip_mp in nodes:
+                # Use nose tip as anchor for full partition (more stable, central reference)
+                anchor_remapped_idx = nodes.index(nose_tip_mp)
+            else:
+                # Use node 0 for lips/mouth partitions (nose tip not available)
+                anchor_remapped_idx = 0
         else:
-            # Use node 0 for lips/mouth partitions (nose tip not available)
-            anchor_remapped_idx = 0
+            anchor_remapped_idx = anchor_idx
         
-        anchor_indices = torch.tensor([anchor_remapped_idx], device=device)
-        anchor_coords = coords[:, anchor_indices, :]  # (frames, n_anchors, 2)
+        # OPTIMIZED: Direct distance computation without creating large intermediate tensor
+        anchor_coords = coords[:, anchor_remapped_idx:anchor_remapped_idx+1, :]  # (frames, 1, 2)
         
-        # Compute distances: (frames, n_anchors, n_nodes)
-        distances = torch.norm(
-            coords.unsqueeze(2) - anchor_coords.unsqueeze(1), 
-            dim=3
-        )  # (frames, n_nodes, n_anchors)
-        distances = distances.transpose(1, 2)  # (frames, n_anchors, n_nodes)
+        # Compute distances more efficiently: (frames, n_nodes)
+        # Use broadcasting: coords (frames, n_nodes, 2) - anchor_coords (frames, 1, 2)
+        diff = coords - anchor_coords  # (frames, n_nodes, 2)
+        distances = torch.norm(diff, dim=2, keepdim=True)  # (frames, n_nodes, 1)
         
         # 2. Angles between consecutive nodes (vectorized)
         # Compute vectors: prev->current and current->next
@@ -269,10 +289,10 @@ class FeatureEngineer:
         angles = torch.acos(cos_angles)  # (frames, n_nodes)
         
         # Ratio removed for memory optimization (not meaningful for full partition)
-        # Stack all features: distances (n_anchors), angles (1)
-        # Shape: (frames, n_nodes, n_anchors + 1)
+        # Stack all features: distances (1), angles (1)
+        # Shape: (frames, n_nodes, 2)
         geom_features = torch.cat([
-            distances.transpose(1, 2),  # (frames, n_nodes, n_anchors)
+            distances,                  # (frames, n_nodes, 1)
             angles.unsqueeze(2),        # (frames, n_nodes, 1)
         ], dim=2)
         
@@ -283,10 +303,12 @@ class FeatureEngineer:
         landmarks: torch.Tensor,
         meta: Dict,
         partition: str,
-        node_mapping: Dict
+        node_mapping: Dict,
+        b0_coords: Optional[torch.Tensor] = None,
+        b2_features: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict]:
         """
-        B3: Returns ONLY AU features (incremental, non-overlapping with B0/B1/B2).
+        B3: Returns B0 + B1 + B2 + AU features (cumulative, includes B0+B1+B2).
         PCA and motion energy removed for aggressive memory optimization.
         
         Args:
@@ -294,15 +316,32 @@ class FeatureEngineer:
             meta: Video metadata
             partition: 'lips', 'mouth', or 'full'
             node_mapping: Original MediaPipe index -> new index
+            b0_coords: Optional pre-computed B0 coordinates (faster)
+            b2_features: Optional pre-computed B2 features (B0+B1+B2, faster, avoids recomputation)
             
         Returns:
-            Tuple of (features, additional_meta) - ONLY AU features, NOT B0+B1+B2+B3
+            Tuple of (features, additional_meta) - B0+B1+B2+B3 (11 features total)
         """
-        # B0 coords for AU computation
-        b0 = self.compute_B0(landmarks, meta)
+        # OPTIMIZATION: Use existing B0+B1+B2 if provided (much faster)
+        if b2_features is not None:
+            b0_b1_b2 = b2_features  # Already has B0+B1+B2
+            b0 = b2_features[:, :, :2]  # Extract B0 for AU computation
+        else:
+            # Compute B0
+            if b0_coords is not None:
+                b0 = b0_coords
+            else:
+                b0 = self.compute_B0(landmarks, meta)
+            
+            # Compute B2 (B0+B1+B2)
+            b2 = self.compute_B2(landmarks, meta, partition, b0_coords=b0)  # Returns B0+B1+B2
+            b0_b1_b2 = b2
         
-        # AU features only (PCA and motion energy removed for memory optimization)
+        # AU features only (B3 incremental)
         au_features, au_groups = self.compute_AU_features(b0, partition, node_mapping)
+        
+        # Return B0 + B1 + B2 + B3 (cumulative)
+        features = torch.cat([b0_b1_b2, au_features], dim=-1)  # (frames, n_nodes, 11)
         
         # Additional meta
         additional_meta = {
@@ -310,7 +349,7 @@ class FeatureEngineer:
             'pca_n_components': 0,  # PCA removed
         }
         
-        return au_features, additional_meta
+        return features, additional_meta
     
     def compute_AU_features(
         self,
@@ -494,6 +533,7 @@ class FeatureEngineer:
             additional_meta = {}
         
         elif self.feature_level == 'B2':
+            # B2 can accept optional b0_coords for optimization (passed via compute_features)
             features = self.compute_B2(landmarks, meta, partition)
             additional_meta = {}
         
@@ -511,19 +551,22 @@ class FeatureEngineer:
 def process_split_features(
     extracted_data_path: str,
     feature_level: str,
-    output_path: str
+    output_path: str,
+    b0_features_path: Optional[str] = None,
+    b1_features_path: Optional[str] = None,
+    b2_features_path: Optional[str] = None
 ) -> None:
     """
     Process features for an entire split.
-    Each feature level (B0-B4) stores ONLY its incremental features (non-overlapping).
+    Each feature level (B0-B3) stores CUMULATIVE features (includes all previous levels).
     
-    Storage format (non-overlapping):
-    - B0: Only B0 features (2 features: x, y)
-    - B1: Velocity + acceleration + speed (5 features: vx, vy, ax, ay, speed)
-    - B2: Only geometric features
-    - B3: Only AU + PCA + motion energy
+    Storage format (cumulative):
+    - B0: B0 features only (2 features: x, y)
+    - B1: B0 + B1 features (5 features: B0: 2 + B1: 3)
+    - B2: B0 + B1 + B2 features (7 features: B0: 2 + B1: 3 + B2: 2)
+    - B3: B0 + B1 + B2 + B3 features (11 features: B0: 2 + B1: 3 + B2: 2 + B3: 4)
     
-    The data loader will concatenate B0+B1+B2+... when loading for training.
+    When loading for training, just load the target level file (no concatenation needed).
     
     Args:
         extracted_data_path: Path to extracted landmarks .pt file
@@ -545,7 +588,7 @@ def process_split_features(
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning)
-        extracted_data = torch.load(extracted_data_path, map_location='cpu')
+        extracted_data = torch.load(extracted_data_path, map_location='cpu', weights_only=False)
     
     # Extract metadata
     partition = extracted_data['partition']
@@ -560,6 +603,67 @@ def process_split_features(
     
     # Initialize feature engineer (each level computes independently from landmarks)
     fe = FeatureEngineer(feature_level=feature_level)
+    
+    # OPTIMIZATION: Load previous level features if available (for faster computation)
+    # B1 can use B0, B2 can use B1 (which includes B0), B3 can use B2 (which includes B0+B1+B2)
+    b0_features_data = None
+    b1_features_data = None
+    b2_features_data = None
+    
+    if feature_level == 'B1' and b0_features_path and Path(b0_features_path).exists():
+        logger.info(f"Loading existing B0 features from {b0_features_path} for faster B1 computation...")
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=FutureWarning)
+                b0_features_data = torch.load(b0_features_path, map_location='cpu')
+            logger.info(f"✓ Loaded B0 features for {len(b0_features_data.get('videos', {}))} videos")
+        except Exception as e:
+            logger.warning(f"Failed to load B0 features: {e}. Will compute from landmarks (slower).")
+            b0_features_data = None
+    
+    elif feature_level == 'B2':
+        if b1_features_path and Path(b1_features_path).exists():
+            logger.info(f"Loading existing B1 features (B0+B1) from {b1_features_path} for faster B2 computation...")
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=FutureWarning)
+                    b1_features_data = torch.load(b1_features_path, map_location='cpu', weights_only=False)
+                logger.info(f"✓ Loaded B1 features for {len(b1_features_data.get('videos', {}))} videos")
+            except Exception as e:
+                logger.warning(f"Failed to load B1 features: {e}. Will compute from landmarks (slower).")
+                b1_features_data = None
+        elif b0_features_path and Path(b0_features_path).exists():
+            logger.info(f"Loading existing B0 features from {b0_features_path} for faster B2 computation...")
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=FutureWarning)
+                    b0_features_data = torch.load(b0_features_path, map_location='cpu', weights_only=False)
+                logger.info(f"✓ Loaded B0 features for {len(b0_features_data.get('videos', {}))} videos")
+            except Exception as e:
+                logger.warning(f"Failed to load B0 features: {e}. Will compute from landmarks (slower).")
+                b0_features_data = None
+    
+    elif feature_level == 'B3':
+        if b2_features_path and Path(b2_features_path).exists():
+            logger.info(f"Loading existing B2 features (B0+B1+B2) from {b2_features_path} for faster B3 computation...")
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=FutureWarning)
+                    b2_features_data = torch.load(b2_features_path, map_location='cpu', weights_only=False)
+                logger.info(f"✓ Loaded B2 features for {len(b2_features_data.get('videos', {}))} videos")
+            except Exception as e:
+                logger.warning(f"Failed to load B2 features: {e}. Will compute from landmarks (slower).")
+                b2_features_data = None
+        elif b0_features_path and Path(b0_features_path).exists():
+            logger.info(f"Loading existing B0 features from {b0_features_path} for faster B3 computation...")
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=FutureWarning)
+                    b0_features_data = torch.load(b0_features_path, map_location='cpu', weights_only=False)
+                logger.info(f"✓ Loaded B0 features for {len(b0_features_data.get('videos', {}))} videos")
+            except Exception as e:
+                logger.warning(f"Failed to load B0 features: {e}. Will compute from landmarks (slower).")
+                b0_features_data = None
     
     # Initialize output structure
     feature_data = {
@@ -582,7 +686,17 @@ def process_split_features(
     processed_count = 0
     logger.info(f"Processing {total_videos} videos...")
     
-    for video_id, video_data in videos.items():
+    # Add progress bar for long-running feature computation
+    video_items = list(videos.items())
+    progress_bar = tqdm(
+        video_items,
+        desc=f"Computing {feature_level} features",
+        unit="video",
+        total=total_videos,
+        disable=False  # Always show progress bar
+    )
+    
+    for video_id, video_data in progress_bar:
         # Extract video data
         landmarks = video_data['landmarks'].clone()  # Clone to avoid keeping reference
         meta = video_data['meta']
@@ -591,14 +705,70 @@ def process_split_features(
         label = video_data['label']
         speech_mask = video_data['speech_mask']
         
-        # Compute features for THIS level only (independent computation)
-        # Each level (B0-B4) computes directly from landmarks, not from previous levels
-        features, additional_meta = fe.compute_features(
-            landmarks,
-            meta,
-            partition=partition,
-            node_mapping=node_mapping
-        )
+        # Compute features (cumulative: each level includes all previous levels)
+        # OPTIMIZATION: Use existing previous level features if available (much faster)
+        if feature_level == 'B1' and b0_features_data is not None:
+            video_b0_features = b0_features_data['videos'].get(video_id)
+            if video_b0_features is not None:
+                # Use existing B0 features (faster - no B0 recomputation)
+                b0_coords = video_b0_features['features']  # B0 only (2 features)
+                # Compute B1 incremental features (velocity + speed)
+                velocity = fe.compute_velocity(b0_coords)
+                speed = fe.compute_speed(velocity)
+                b1_incremental = torch.cat([velocity, speed], dim=-1)  # (frames, n_nodes, 3)
+                # Concatenate B0 + B1 (cumulative)
+                features = torch.cat([b0_coords, b1_incremental], dim=-1)  # (frames, n_nodes, 5)
+                additional_meta = {}
+            else:
+                features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
+        
+        elif feature_level == 'B2':
+            if b1_features_data is not None:
+                video_b1_features = b1_features_data['videos'].get(video_id)
+                if video_b1_features is not None:
+                    # Use existing B1 features (B0+B1) - fastest path
+                    b1_features = video_b1_features['features']  # B0+B1 (5 features)
+                    b0_coords = b1_features[:, :, :2]  # Extract B0 for geometric computation
+                    features = fe.compute_B2(landmarks, meta, partition, b0_coords=b0_coords, b1_features=b1_features)
+                    additional_meta = {}
+                else:
+                    features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
+            elif b0_features_data is not None:
+                video_b0_features = b0_features_data['videos'].get(video_id)
+                if video_b0_features is not None:
+                    # Use existing B0 features
+                    b0_coords = video_b0_features['features']  # B0 only (2 features)
+                    features = fe.compute_B2(landmarks, meta, partition, b0_coords=b0_coords)
+                    additional_meta = {}
+                else:
+                    features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
+            else:
+                features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
+        
+        elif feature_level == 'B3':
+            if b2_features_data is not None:
+                video_b2_features = b2_features_data['videos'].get(video_id)
+                if video_b2_features is not None:
+                    # Use existing B2 features (B0+B1+B2) - fastest path
+                    b2_features = video_b2_features['features']  # B0+B1+B2 (7 features)
+                    b0_coords = b2_features[:, :, :2]  # Extract B0 for AU computation
+                    features, additional_meta = fe.compute_B3(landmarks, meta, partition, node_mapping, b0_coords=b0_coords, b2_features=b2_features)
+                else:
+                    features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
+            elif b0_features_data is not None:
+                video_b0_features = b0_features_data['videos'].get(video_id)
+                if video_b0_features is not None:
+                    # Use existing B0 features
+                    b0_coords = video_b0_features['features']  # B0 only (2 features)
+                    features, additional_meta = fe.compute_B3(landmarks, meta, partition, node_mapping, b0_coords=b0_coords)
+                else:
+                    features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
+            else:
+                features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
+        
+        else:
+            # B0: Normal computation
+            features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
         
         # Store processed video (only features for this level)
         # Keep as float32 for accuracy (float16 causes precision loss and accuracy degradation)
@@ -624,8 +794,18 @@ def process_split_features(
     
         processed_count += 1
         
+        # Update progress bar description with count
+        if processed_count % 100 == 0 or processed_count == total_videos:
+            progress_bar.set_postfix({
+                'processed': f'{processed_count}/{total_videos}',
+                'progress': f'{100*processed_count/total_videos:.1f}%'
+            })
+        
         # Clear video data immediately (no overlap with other levels)
         del landmarks, features
+    
+    # Close progress bar
+    progress_bar.close()
     
     # Save final result
     # Note: torch.save() uses zipfile format by default (since PyTorch 1.6)

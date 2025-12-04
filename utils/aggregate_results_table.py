@@ -49,7 +49,7 @@ def collect_results(results_dir, partition):
                 
                 try:
                     # Load run metadata
-                    run_meta = torch.load(run_meta_file)
+                    run_meta = torch.load(run_meta_file, weights_only=False)
                     
                     # Get config from run_meta (it's saved there)
                     config = run_meta.get('config', None)

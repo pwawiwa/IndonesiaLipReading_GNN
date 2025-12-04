@@ -269,7 +269,7 @@ def evaluate_model(
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_config = checkpoint['model_config']
     
     # Load test data

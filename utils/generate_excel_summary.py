@@ -33,7 +33,7 @@ def extract_run_info(result_dir: Path) -> Optional[Dict]:
     # Try to load run_meta.pt
     if run_meta_file.exists():
         try:
-            run_meta = torch.load(run_meta_file, map_location='cpu')
+            run_meta = torch.load(run_meta_file, map_location='cpu', weights_only=False)
             
             # Extract key metrics
             info.update({
@@ -409,6 +409,8 @@ def main():
                        help='Results directory path')
     parser.add_argument('--output', type=str, default='results/training_summary.xlsx',
                        help='Output Excel file path')
+    parser.add_argument('--append', action='store_true',
+                       help='Append mode: preserve existing data and only add new results')
     
     args = parser.parse_args()
     
@@ -416,23 +418,84 @@ def main():
     output_file = Path(args.output)
     
     print("=" * 80)
-    print("GENERATING EXCEL SUMMARY")
+    if args.append:
+        print("APPENDING TO EXCEL SUMMARY (PRESERVE EXISTING DATA)")
+    else:
+        print("GENERATING EXCEL SUMMARY")
     print("=" * 80)
     print(f"Results directory: {results_dir}")
     print(f"Output file: {output_file}")
     print()
     
-    # Collect all results
-    print("Collecting results...")
-    results = collect_all_results(results_dir)
-    print(f"Found {len(results)} training runs")
+    # Collect all results from directory
+    print("Collecting results from directory...")
+    all_results = collect_all_results(results_dir)
+    print(f"Found {len(all_results)} training runs in directory")
     
-    if not results:
+    if not all_results:
         print("No results found!")
         return
     
+    # If append mode and file exists, merge with existing data
+    if args.append and output_file.exists():
+        print(f"\nReading existing Excel file: {output_file}")
+        try:
+            xls = pd.ExcelFile(output_file)
+            if 'All_Results' in xls.sheet_names:
+                existing_df = pd.read_excel(output_file, sheet_name='All_Results')
+                existing_paths = set(existing_df['result_path'].values) if 'result_path' in existing_df.columns else set()
+                print(f"  Found {len(existing_paths)} existing results in Excel file")
+                
+                # Filter out results that already exist
+                new_results = [r for r in all_results if r.get('result_path') not in existing_paths]
+                existing_results = [r for r in all_results if r.get('result_path') in existing_paths]
+                
+                print(f"  New results to add: {len(new_results)}")
+                print(f"  Existing results (will be updated if changed): {len(existing_results)}")
+                
+                if new_results:
+                    # Convert existing DataFrame back to dict format for merging
+                    existing_dicts = existing_df.to_dict('records')
+                    # Merge: keep existing data, add new results
+                    # For existing results, we'll update them with latest data from directory
+                    results = existing_dicts + new_results
+                    # Also update existing results with latest data if they exist in directory
+                    for existing_result in existing_dicts:
+                        existing_path = existing_result.get('result_path')
+                        # Find corresponding result from directory
+                        for dir_result in existing_results:
+                            if dir_result.get('result_path') == existing_path:
+                                # Update with latest data from directory
+                                existing_result.update(dir_result)
+                                break
+                else:
+                    print("  No new results to add. All results already in Excel file.")
+                    # Still update existing results with latest data
+                    existing_dicts = existing_df.to_dict('records')
+                    for existing_result in existing_dicts:
+                        existing_path = existing_result.get('result_path')
+                        for dir_result in existing_results:
+                            if dir_result.get('result_path') == existing_path:
+                                existing_result.update(dir_result)
+                                break
+                    results = existing_dicts
+            else:
+                print("  No 'All_Results' sheet found, will create new file")
+                results = all_results
+        except Exception as e:
+            print(f"  Warning: Could not read existing file: {e}")
+            print("  Will create new file with all results")
+            results = all_results
+    else:
+        # Normal mode: use all results
+        results = all_results
+    
+    if not results:
+        print("No results to process!")
+        return
+    
     # Create summary sheets
-    print("Creating summary sheets...")
+    print("\nCreating summary sheets...")
     sheets = create_summary_sheets(results)
     
     if not sheets:
@@ -440,7 +503,7 @@ def main():
         return
     
     # Write to Excel
-    print(f"Writing to {output_file}...")
+    print(f"\nWriting to {output_file}...")
     output_file.parent.mkdir(parents=True, exist_ok=True)
     
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
@@ -457,10 +520,15 @@ def main():
     
     print()
     print("=" * 80)
-    print("✅ EXCEL SUMMARY GENERATED")
+    if args.append:
+        print("✅ EXCEL SUMMARY UPDATED (EXISTING DATA PRESERVED)")
+    else:
+        print("✅ EXCEL SUMMARY GENERATED")
     print("=" * 80)
     print(f"File: {output_file}")
     print(f"Sheets: {', '.join(sheets.keys())}")
+    if args.append:
+        print(f"Total runs: {len(results)}")
     print()
     print("Sheet Descriptions:")
     print("-" * 80)

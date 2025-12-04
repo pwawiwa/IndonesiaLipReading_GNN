@@ -9,7 +9,22 @@ MediaPipe FaceMesh has 468 landmarks. We define three partitions:
 import torch
 import numpy as np
 from typing import List, Tuple, Dict
-import mediapipe as mp
+import warnings
+import sys
+import os
+from contextlib import redirect_stderr
+from io import StringIO
+
+# Suppress protobuf compatibility warning from MediaPipe
+# This is a harmless error: protobuf 6.x removed GetPrototype but MediaPipe still works
+# The error appears on stderr but doesn't affect functionality
+try:
+    # Suppress stderr during MediaPipe import to hide AttributeError
+    with redirect_stderr(StringIO()):
+        import mediapipe as mp
+except Exception:
+    # If suppression fails, import normally (error will appear but won't break functionality)
+    import mediapipe as mp
 
 # Get MediaPipe's default connections
 mp_face_mesh = mp.solutions.face_mesh
@@ -52,183 +67,171 @@ def get_lips_nodes() -> List[int]:
 
 def get_mouth_area_nodes() -> List[int]:
     """
-    Get node indices for mouth_area partition (lips + cheeks + chin).
+    Get node indices for mouth_area partition (lips + jaw + cheeks + nose).
     
-    This function ensures full connectivity by:
-    1. Starting with core mouth region nodes (lips, cheeks, jaw)
-    2. Including additional lower face nodes needed for connectivity
-    3. Using BFS to find the connected component containing all core nodes
+    IMPORTANT: Returns ORIGINAL MediaPipe node indices (0-467), NOT remapped indices.
+    These indices correspond to fixed MediaPipe FaceMesh landmark positions.
+    The remapping to 0, 1, 2, ... N-1 happens in build_partition_adjacency().
+    
+    Selection criteria:
+    1. All lips nodes (inner + outer)
+    2. Jaw nodes (symmetrical - both left and right)
+    3. Cheek nodes (symmetrical - both left and right)
+    4. Nose nodes (for anchor)
+    5. All nodes connected to the above (via BFS)
     
     Returns:
-        List of node indices (fully connected, focused on mouth region)
+        List of ORIGINAL MediaPipe node indices (0-467) in sorted order (deterministic)
     """
-    # Start with core mouth region nodes
-    # Lips (inner + outer) - full coverage
+    # 1. All lips nodes (inner + outer)
     lips = get_lips_nodes()
     
-    # Cheek landmarks - full coverage
-    cheeks = [
-        # Left cheek
+    # 2. Jaw nodes (symmetrical - left and right)
+    # Left jaw
+    left_jaw = [
+        58, 172, 136, 150, 149, 176, 148,  # Left jaw line
+        18, 200, 199, 175, 169, 170, 140, 135, 138, 171,  # Left lower jaw
+        204, 208,  # Left jaw continuation
+    ]
+    # Right jaw (symmetrical)
+    right_jaw = [
+        288, 361, 323, 454,  # Right jaw line
+        364, 367, 369, 394, 395, 396, 430,  # Right lower jaw
+        377, 400, 378, 379, 365, 397,  # Right jaw continuation
+    ]
+    # Chin center (shared)
+    chin_center = [152]
+    
+    jaw = left_jaw + right_jaw + chin_center
+    
+    # 3. Cheek nodes (symmetrical - left and right)
+    # Left cheek
+    left_cheek = [
         50, 118, 119, 100, 101, 36, 203, 205, 206, 216,
-        # Right cheek
+    ]
+    # Right cheek (symmetrical)
+    right_cheek = [
         280, 347, 348, 330, 329, 266, 423, 425, 426, 436,
     ]
     
-    # Chin and jaw - full coverage
-    chin_jaw = [
-        # Chin center and surrounding
-        152, 377, 400, 378, 379, 365, 397, 288, 361, 323,
-        # Jaw line (full)
-        58, 172, 136, 150, 149, 176, 148, 152, 454,
-        # Additional lower jaw nodes for full coverage
-        18, 200, 199, 175, 169, 170, 140, 135, 138, 171,
-        204, 208, 364, 367, 369, 394, 395, 396, 430,
-    ]
+    cheeks = left_cheek + right_cheek
     
-    # Nose bottom (for mouth context)
-    nose_bottom = [2, 98, 327]
+    # 4. Nose node (for anchor) - only 1 node
+    nose = [4]  # Nose tip only (primary anchor)
     
-    # Additional lower face mesh nodes for connectivity
-    # These are intermediate nodes in the tesselation that connect mouth components
-    additional_connecting = [
-        # Lower face mesh nodes that connect lips to cheeks/jaw
-        93, 123, 137, 147, 177, 213, 215, 352, 356, 360,
-        366, 376, 401, 411, 427, 485, 487,
-        # Additional nodes in lower face region
-        132, 133, 134, 136, 142, 143, 144, 145, 153, 154,
-        162, 163, 164, 165, 166, 167, 173, 174,
-    ]
+    # Core nodes: lips + jaw + cheeks + nose
+    core_nodes = set(lips + jaw + cheeks + nose)
     
-    # Combine all candidate nodes
-    all_candidates = list(set(
-        lips + cheeks + chin_jaw + nose_bottom + additional_connecting
-    ))
-    
-    # Build full adjacency to verify connectivity
+    # Build full adjacency for BFS
     full_adj = build_full_adjacency()
     
-    # Use BFS to find the connected component containing core mouth nodes
-    # Start BFS from lips nodes (most important for mouth partition)
-    core_start_nodes = lips[:5]  # Start from a few lip nodes
-    node_set = set(all_candidates)
+    # 5. Use BFS to find all nodes connected to core nodes (limited to mouth region)
+    # Limit BFS to only explore nodes within the lower face/mouth region
+    # Define candidate region: lower face nodes that could connect mouth components
+    # This includes nodes in the lower half of the face (roughly Y > 0.4 in normalized coordinates)
+    # We'll use a hop-limited BFS: only explore up to 2-3 hops from core nodes
+    
+    # Lower face region candidates (nodes that could be in mouth region)
+    # These are nodes that are geometrically in the lower face area
+    lower_face_candidates = set()
+    
+    # Add all nodes that are directly connected to core nodes (1 hop)
+    for core_node in core_nodes:
+        for neighbor in range(468):
+            if full_adj[core_node, neighbor] > 0.5:
+                lower_face_candidates.add(neighbor)
+    
+    # Add nodes that are 2 hops away from core nodes (still in mouth region)
+    second_hop = set()
+    for candidate in lower_face_candidates:
+        for neighbor in range(468):
+            if full_adj[candidate, neighbor] > 0.5:
+                second_hop.add(neighbor)
+    
+    # Combine: core nodes + 1 hop + 2 hops
+    all_candidates = core_nodes | lower_face_candidates | second_hop
+    
+    # Use BFS to find connected component within candidates
     visited = set()
     connected_component = set()
     
-    def bfs_from_start(start_node):
-        """BFS to find connected component from start node."""
+    def bfs_from_core(start_nodes, candidate_set):
+        """BFS to find connected component from core nodes, limited to candidate set."""
         component = set()
-        queue = [start_node]
-        visited_local = {start_node}
+        queue = list(start_nodes)
+        visited_bfs = set(start_nodes)
         
         while queue:
             current = queue.pop(0)
-            if current in node_set:  # Only include if in our candidate set
+            if current in candidate_set:  # Only include if in candidate set
                 component.add(current)
-            for neighbor in range(468):
-                if (full_adj[current, neighbor] > 0.5 and 
-                    neighbor not in visited_local):
-                    visited_local.add(neighbor)
-                    if neighbor in node_set:  # Only explore if in candidate set
-                        queue.append(neighbor)
+            # Sort neighbors for deterministic order
+            neighbors = sorted([n for n in range(468) 
+                              if full_adj[current, n] > 0.5 and n not in visited_bfs])
+            for neighbor in neighbors:
+                visited_bfs.add(neighbor)
+                if neighbor in candidate_set:  # Only explore if in candidate set
+                    queue.append(neighbor)
         return component
     
-    # Find connected component starting from core nodes
-    for start_node in core_start_nodes:
-        if start_node not in visited:
-            component = bfs_from_start(start_node)
-            connected_component.update(component)
-            visited.update(component)
+    # Start BFS from core nodes (deterministic: sorted)
+    sorted_core = sorted(core_nodes)
+    connected_component = bfs_from_core(sorted_core, all_candidates)
     
-    # Ensure all core nodes are included (add them if not in component)
-    # CRITICAL: All lip nodes must be included (including inner corners 78, 308)
-    core_nodes = set(lips + cheeks + chin_jaw + nose_bottom)
+    # Ensure all core nodes are included (they must be in the partition)
     connected_component.update(core_nodes)
     
-    # Force all lip nodes to be in the final component (they're core)
-    # This ensures inner corners 78, 308 are included even if BFS missed them
-    for lip_node in lips:
-        connected_component.add(lip_node)
-    
-    # Final BFS to ensure single connected component
-    # Re-run BFS from all nodes in component to get full connectivity
-    final_component = set()
+    # Final BFS to ensure single connected component within candidates
     visited_final = set()
+    final_component = set()
     
-    def bfs_final(start_node):
-        """Final BFS to get complete connected component."""
+    def bfs_final(start_node, candidate_set):
+        """Final BFS to get complete connected component within candidates."""
         component = set()
         queue = [start_node]
         visited_bfs = {start_node}
         
         while queue:
             current = queue.pop(0)
-            component.add(current)
-            for neighbor in range(468):
-                if (full_adj[current, neighbor] > 0.5 and 
-                    neighbor in connected_component and
-                    neighbor not in visited_bfs):
-                    visited_bfs.add(neighbor)
-                    queue.append(neighbor)
+            if current in candidate_set:
+                component.add(current)
+            # Sort neighbors for deterministic order
+            neighbors = sorted([n for n in range(468)
+                              if (full_adj[current, n] > 0.5 and 
+                                  n in candidate_set and
+                                  n not in visited_bfs)])
+            for neighbor in neighbors:
+                visited_bfs.add(neighbor)
+                queue.append(neighbor)
         return component
     
-    # Find the largest connected component
-    for node in connected_component:
+    # Find the largest connected component (deterministic: iterate in sorted order)
+    for node in sorted(connected_component):
         if node not in visited_final:
-            component = bfs_final(node)
+            component = bfs_final(node, all_candidates)
             if len(component) > len(final_component):
                 final_component = component
+            elif len(component) == len(final_component) and len(component) > 0:
+                # If same size, choose deterministically by smallest first node
+                if min(component) < min(final_component):
+                    final_component = component
             visited_final.update(component)
     
-    # CRITICAL: Force all lip nodes to be included (they're core nodes)
-    # This ensures inner corners 78, 308 and all inner lip nodes are included
-    for lip_node in lips:
-        final_component.add(lip_node)
-        # Also add any nodes directly connected to lip nodes in the full mesh
-        for neighbor in range(468):
-            if full_adj[lip_node, neighbor] > 0.5:
-                if neighbor in all_candidates:  # Only if in our candidate set
-                    final_component.add(neighbor)
+    # Ensure all core nodes are in final component
+    final_component.update(core_nodes)
     
-    # Re-run BFS to ensure single connected component after adding lip nodes
-    # This connects any isolated lip nodes to the main component
-    visited_reconnect = set()
-    all_final_nodes = set(final_component)
+    # Remove all nose nodes except nose tip (4)
+    # Only keep node 4 for nose anchor
+    nose_nodes_to_remove = [2, 6, 8, 9, 49, 98, 168, 220, 290, 305, 327]
+    for nose_node in nose_nodes_to_remove:
+        if nose_node in final_component:
+            final_component.remove(nose_node)
     
-    def bfs_reconnect(start_node):
-        """BFS to reconnect isolated nodes."""
-        component = set()
-        queue = [start_node]
-        visited_bfs = {start_node}
-        
-        while queue:
-            current = queue.pop(0)
-            component.add(current)
-            for neighbor in range(468):
-                if (full_adj[current, neighbor] > 0.5 and 
-                    neighbor in all_final_nodes and
-                    neighbor not in visited_bfs):
-                    visited_bfs.add(neighbor)
-                    queue.append(neighbor)
-        return component
+    # Ensure nose tip (4) is included
+    if 4 not in final_component:
+        final_component.add(4)
     
-    # Find all connected components in final_component
-    all_components = []
-    for node in final_component:
-        if node not in visited_reconnect:
-            component = bfs_reconnect(node)
-            all_components.append(component)
-            visited_reconnect.update(component)
-    
-    # Use the largest component (should include all core nodes)
-    if all_components:
-        final_component = max(all_components, key=len)
-        # Ensure all core nodes are in final component
-        for core_node in core_nodes:
-            final_component.add(core_node)
-        # Reconnect one more time to include all core nodes
-        final_component = bfs_reconnect(list(core_nodes)[0])
-    
-    # Return sorted list
+    # Return sorted list (deterministic)
     all_nodes = sorted(list(final_component))
     
     return all_nodes
@@ -248,11 +251,15 @@ def get_partition_nodes(partition: str) -> List[int]:
     """
     Get node indices for specified partition.
     
+    IMPORTANT: Returns ORIGINAL MediaPipe node indices (0-467), NOT remapped indices.
+    These indices correspond to fixed MediaPipe FaceMesh landmark positions.
+    The remapping to 0, 1, 2, ... N-1 happens in build_partition_adjacency().
+    
     Args:
         partition: One of 'lips', 'mouth', 'full'
         
     Returns:
-        List of node indices
+        List of ORIGINAL MediaPipe node indices (0-467) in sorted order (deterministic)
     """
     if partition == 'lips':
         return get_lips_nodes()
@@ -340,6 +347,9 @@ def build_partition_adjacency(partition: str) -> Tuple[torch.Tensor, Dict[int, i
                 new_i = node_mapping[orig_i]
                 new_j = node_mapping[orig_j]
                 adj[new_i, new_j] = 1.0
+    
+    # No manual connections needed - using clean partition with only lips, jaw, cheeks, nose
+    # All connections come from MediaPipe's default tesselation
     
     return adj, node_mapping
 
@@ -436,11 +446,11 @@ def get_au_node_groups(partition: str, node_mapping: Dict[int, int]) -> Dict[str
         
         # If AU27 doesn't have enough nodes, add remaining mouth area nodes
         if len(au_groups['AU27_mouth_stretch']) < 10:
-        all_nodes_remapped = set(node_mapping.values())
-        assigned_nodes = set()
-        for group_nodes in au_groups.values():
-            assigned_nodes.update(group_nodes)
-        remaining = sorted(list(all_nodes_remapped - assigned_nodes))
+            all_nodes_remapped = set(node_mapping.values())
+            assigned_nodes = set()
+            for group_nodes in au_groups.values():
+                assigned_nodes.update(group_nodes)
+            remaining = sorted(list(all_nodes_remapped - assigned_nodes))
             if remaining:
                 au_groups['AU27_mouth_stretch'].extend(remaining[:min(15, len(remaining))])
     
@@ -507,13 +517,13 @@ def get_au_node_groups(partition: str, node_mapping: Dict[int, int]) -> Dict[str
         
         # If AU27 doesn't have enough nodes, add remaining mouth area nodes
         if len(au_groups['AU27_mouth_stretch']) < 10:
-        all_nodes_remapped = set(node_mapping.values())
-        assigned_nodes = set()
-        for group_nodes in au_groups.values():
-            assigned_nodes.update(group_nodes)
-        remaining = sorted(list(all_nodes_remapped - assigned_nodes))
+            all_nodes_remapped = set(node_mapping.values())
+            assigned_nodes = set()
+            for group_nodes in au_groups.values():
+                assigned_nodes.update(group_nodes)
+            remaining = sorted(list(all_nodes_remapped - assigned_nodes))
             # Add remaining mouth-related nodes to AU27
-        if remaining:
+            if remaining:
                 au_groups['AU27_mouth_stretch'].extend(remaining[:min(15, len(remaining))])
     
     # Sort node indices within each group

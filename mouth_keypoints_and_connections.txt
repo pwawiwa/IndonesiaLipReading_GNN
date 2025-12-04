@@ -1,0 +1,450 @@
+================================================================================
+MOUTH PARTITION KEYPOINTS AND CONNECTIONS
+================================================================================
+
+Total Nodes: 277
+Total Edges: 723
+Adjacency Matrix Shape: torch.Size([277, 277])
+
+================================================================================
+ORIGINAL MEDIAPIPE NODE INDICES (0-467)
+================================================================================
+
+These are the original MediaPipe FaceMesh landmark indices used in the mouth partition:
+
+Node indices:
+    0,   1,   3,   4,   5,  11,  12,  13,  14,  15
+   16,  17,  18,  19,  22,  23,  24,  31,  32,  36
+   37,  38,  39,  40,  41,  42,  43,  44,  45,  47
+   50,  51,  57,  58,  61,  62,  64,  72,  73,  74
+   76,  77,  78,  80,  81,  82,  83,  84,  85,  86
+   87,  88,  89,  90,  91,  92,  93,  95,  96,  97
+   99, 100, 101, 102, 106, 111, 114, 116, 117, 118
+  119, 120, 121, 123, 125, 126, 128, 129, 132, 134
+  135, 136, 137, 138, 140, 142, 146, 147, 148, 149
+  150, 152, 164, 165, 167, 169, 170, 171, 172, 175
+  176, 177, 178, 179, 180, 181, 182, 183, 184, 185
+  186, 187, 191, 192, 194, 195, 199, 200, 201, 202
+  203, 204, 205, 206, 207, 208, 209, 210, 211, 212
+  213, 214, 215, 216, 217, 228, 229, 230, 231, 232
+  236, 237, 240, 248, 252, 253, 254, 261, 262, 264
+  266, 267, 268, 269, 270, 271, 272, 273, 274, 275
+  277, 279, 280, 281, 287, 288, 291, 292, 294, 302
+  303, 304, 306, 307, 308, 310, 311, 312, 313, 314
+  315, 316, 317, 318, 319, 320, 321, 322, 323, 324
+  325, 326, 328, 329, 330, 331, 335, 340, 343, 345
+  346, 347, 348, 349, 350, 352, 354, 355, 356, 357
+  358, 361, 363, 364, 365, 366, 367, 368, 369, 371
+  372, 375, 376, 377, 378, 379, 383, 389, 391, 393
+  394, 395, 396, 397, 400, 401, 402, 403, 404, 405
+  406, 407, 408, 409, 410, 411, 415, 416, 418, 421
+  422, 423, 424, 425, 426, 427, 428, 429, 430, 431
+  432, 433, 434, 435, 436, 437, 440, 447, 448, 449
+  450, 451, 452, 454, 456, 457, 460
+
+================================================================================
+NODE MAPPING (Original MediaPipe Index -> Remapped Index)
+================================================================================
+
+The remapped indices are used internally (0 to N-1) for the adjacency matrix.
+
+  Original   0 -> Remapped   0 |   Original   1 -> Remapped   1 |   Original   3 -> Remapped   2
+  Original   4 -> Remapped   3 |   Original   5 -> Remapped   4 |   Original  11 -> Remapped   5
+  Original  12 -> Remapped   6 |   Original  13 -> Remapped   7 |   Original  14 -> Remapped   8
+  Original  15 -> Remapped   9 |   Original  16 -> Remapped  10 |   Original  17 -> Remapped  11
+  Original  18 -> Remapped  12 |   Original  19 -> Remapped  13 |   Original  22 -> Remapped  14
+  Original  23 -> Remapped  15 |   Original  24 -> Remapped  16 |   Original  31 -> Remapped  17
+  Original  32 -> Remapped  18 |   Original  36 -> Remapped  19 |   Original  37 -> Remapped  20
+  Original  38 -> Remapped  21 |   Original  39 -> Remapped  22 |   Original  40 -> Remapped  23
+  Original  41 -> Remapped  24 |   Original  42 -> Remapped  25 |   Original  43 -> Remapped  26
+  Original  44 -> Remapped  27 |   Original  45 -> Remapped  28 |   Original  47 -> Remapped  29
+  Original  50 -> Remapped  30 |   Original  51 -> Remapped  31 |   Original  57 -> Remapped  32
+  Original  58 -> Remapped  33 |   Original  61 -> Remapped  34 |   Original  62 -> Remapped  35
+  Original  64 -> Remapped  36 |   Original  72 -> Remapped  37 |   Original  73 -> Remapped  38
+  Original  74 -> Remapped  39 |   Original  76 -> Remapped  40 |   Original  77 -> Remapped  41
+  Original  78 -> Remapped  42 |   Original  80 -> Remapped  43 |   Original  81 -> Remapped  44
+  Original  82 -> Remapped  45 |   Original  83 -> Remapped  46 |   Original  84 -> Remapped  47
+  Original  85 -> Remapped  48 |   Original  86 -> Remapped  49 |   Original  87 -> Remapped  50
+  Original  88 -> Remapped  51 |   Original  89 -> Remapped  52 |   Original  90 -> Remapped  53
+  Original  91 -> Remapped  54 |   Original  92 -> Remapped  55 |   Original  93 -> Remapped  56
+  Original  95 -> Remapped  57 |   Original  96 -> Remapped  58 |   Original  97 -> Remapped  59
+  Original  99 -> Remapped  60 |   Original 100 -> Remapped  61 |   Original 101 -> Remapped  62
+  Original 102 -> Remapped  63 |   Original 106 -> Remapped  64 |   Original 111 -> Remapped  65
+  Original 114 -> Remapped  66 |   Original 116 -> Remapped  67 |   Original 117 -> Remapped  68
+  Original 118 -> Remapped  69 |   Original 119 -> Remapped  70 |   Original 120 -> Remapped  71
+  Original 121 -> Remapped  72 |   Original 123 -> Remapped  73 |   Original 125 -> Remapped  74
+  Original 126 -> Remapped  75 |   Original 128 -> Remapped  76 |   Original 129 -> Remapped  77
+  Original 132 -> Remapped  78 |   Original 134 -> Remapped  79 |   Original 135 -> Remapped  80
+  Original 136 -> Remapped  81 |   Original 137 -> Remapped  82 |   Original 138 -> Remapped  83
+  Original 140 -> Remapped  84 |   Original 142 -> Remapped  85 |   Original 146 -> Remapped  86
+  Original 147 -> Remapped  87 |   Original 148 -> Remapped  88 |   Original 149 -> Remapped  89
+  Original 150 -> Remapped  90 |   Original 152 -> Remapped  91 |   Original 164 -> Remapped  92
+  Original 165 -> Remapped  93 |   Original 167 -> Remapped  94 |   Original 169 -> Remapped  95
+  Original 170 -> Remapped  96 |   Original 171 -> Remapped  97 |   Original 172 -> Remapped  98
+  Original 175 -> Remapped  99 |   Original 176 -> Remapped 100 |   Original 177 -> Remapped 101
+  Original 178 -> Remapped 102 |   Original 179 -> Remapped 103 |   Original 180 -> Remapped 104
+  Original 181 -> Remapped 105 |   Original 182 -> Remapped 106 |   Original 183 -> Remapped 107
+  Original 184 -> Remapped 108 |   Original 185 -> Remapped 109 |   Original 186 -> Remapped 110
+  Original 187 -> Remapped 111 |   Original 191 -> Remapped 112 |   Original 192 -> Remapped 113
+  Original 194 -> Remapped 114 |   Original 195 -> Remapped 115 |   Original 199 -> Remapped 116
+  Original 200 -> Remapped 117 |   Original 201 -> Remapped 118 |   Original 202 -> Remapped 119
+  Original 203 -> Remapped 120 |   Original 204 -> Remapped 121 |   Original 205 -> Remapped 122
+  Original 206 -> Remapped 123 |   Original 207 -> Remapped 124 |   Original 208 -> Remapped 125
+  Original 209 -> Remapped 126 |   Original 210 -> Remapped 127 |   Original 211 -> Remapped 128
+  Original 212 -> Remapped 129 |   Original 213 -> Remapped 130 |   Original 214 -> Remapped 131
+  Original 215 -> Remapped 132 |   Original 216 -> Remapped 133 |   Original 217 -> Remapped 134
+  Original 228 -> Remapped 135 |   Original 229 -> Remapped 136 |   Original 230 -> Remapped 137
+  Original 231 -> Remapped 138 |   Original 232 -> Remapped 139 |   Original 236 -> Remapped 140
+  Original 237 -> Remapped 141 |   Original 240 -> Remapped 142 |   Original 248 -> Remapped 143
+  Original 252 -> Remapped 144 |   Original 253 -> Remapped 145 |   Original 254 -> Remapped 146
+  Original 261 -> Remapped 147 |   Original 262 -> Remapped 148 |   Original 264 -> Remapped 149
+  Original 266 -> Remapped 150 |   Original 267 -> Remapped 151 |   Original 268 -> Remapped 152
+  Original 269 -> Remapped 153 |   Original 270 -> Remapped 154 |   Original 271 -> Remapped 155
+  Original 272 -> Remapped 156 |   Original 273 -> Remapped 157 |   Original 274 -> Remapped 158
+  Original 275 -> Remapped 159 |   Original 277 -> Remapped 160 |   Original 279 -> Remapped 161
+  Original 280 -> Remapped 162 |   Original 281 -> Remapped 163 |   Original 287 -> Remapped 164
+  Original 288 -> Remapped 165 |   Original 291 -> Remapped 166 |   Original 292 -> Remapped 167
+  Original 294 -> Remapped 168 |   Original 302 -> Remapped 169 |   Original 303 -> Remapped 170
+  Original 304 -> Remapped 171 |   Original 306 -> Remapped 172 |   Original 307 -> Remapped 173
+  Original 308 -> Remapped 174 |   Original 310 -> Remapped 175 |   Original 311 -> Remapped 176
+  Original 312 -> Remapped 177 |   Original 313 -> Remapped 178 |   Original 314 -> Remapped 179
+  Original 315 -> Remapped 180 |   Original 316 -> Remapped 181 |   Original 317 -> Remapped 182
+  Original 318 -> Remapped 183 |   Original 319 -> Remapped 184 |   Original 320 -> Remapped 185
+  Original 321 -> Remapped 186 |   Original 322 -> Remapped 187 |   Original 323 -> Remapped 188
+  Original 324 -> Remapped 189 |   Original 325 -> Remapped 190 |   Original 326 -> Remapped 191
+  Original 328 -> Remapped 192 |   Original 329 -> Remapped 193 |   Original 330 -> Remapped 194
+  Original 331 -> Remapped 195 |   Original 335 -> Remapped 196 |   Original 340 -> Remapped 197
+  Original 343 -> Remapped 198 |   Original 345 -> Remapped 199 |   Original 346 -> Remapped 200
+  Original 347 -> Remapped 201 |   Original 348 -> Remapped 202 |   Original 349 -> Remapped 203
+  Original 350 -> Remapped 204 |   Original 352 -> Remapped 205 |   Original 354 -> Remapped 206
+  Original 355 -> Remapped 207 |   Original 356 -> Remapped 208 |   Original 357 -> Remapped 209
+  Original 358 -> Remapped 210 |   Original 361 -> Remapped 211 |   Original 363 -> Remapped 212
+  Original 364 -> Remapped 213 |   Original 365 -> Remapped 214 |   Original 366 -> Remapped 215
+  Original 367 -> Remapped 216 |   Original 368 -> Remapped 217 |   Original 369 -> Remapped 218
+  Original 371 -> Remapped 219 |   Original 372 -> Remapped 220 |   Original 375 -> Remapped 221
+  Original 376 -> Remapped 222 |   Original 377 -> Remapped 223 |   Original 378 -> Remapped 224
+  Original 379 -> Remapped 225 |   Original 383 -> Remapped 226 |   Original 389 -> Remapped 227
+  Original 391 -> Remapped 228 |   Original 393 -> Remapped 229 |   Original 394 -> Remapped 230
+  Original 395 -> Remapped 231 |   Original 396 -> Remapped 232 |   Original 397 -> Remapped 233
+  Original 400 -> Remapped 234 |   Original 401 -> Remapped 235 |   Original 402 -> Remapped 236
+  Original 403 -> Remapped 237 |   Original 404 -> Remapped 238 |   Original 405 -> Remapped 239
+  Original 406 -> Remapped 240 |   Original 407 -> Remapped 241 |   Original 408 -> Remapped 242
+  Original 409 -> Remapped 243 |   Original 410 -> Remapped 244 |   Original 411 -> Remapped 245
+  Original 415 -> Remapped 246 |   Original 416 -> Remapped 247 |   Original 418 -> Remapped 248
+  Original 421 -> Remapped 249 |   Original 422 -> Remapped 250 |   Original 423 -> Remapped 251
+  Original 424 -> Remapped 252 |   Original 425 -> Remapped 253 |   Original 426 -> Remapped 254
+  Original 427 -> Remapped 255 |   Original 428 -> Remapped 256 |   Original 429 -> Remapped 257
+  Original 430 -> Remapped 258 |   Original 431 -> Remapped 259 |   Original 432 -> Remapped 260
+  Original 433 -> Remapped 261 |   Original 434 -> Remapped 262 |   Original 435 -> Remapped 263
+  Original 436 -> Remapped 264 |   Original 437 -> Remapped 265 |   Original 440 -> Remapped 266
+  Original 447 -> Remapped 267 |   Original 448 -> Remapped 268 |   Original 449 -> Remapped 269
+  Original 450 -> Remapped 270 |   Original 451 -> Remapped 271 |   Original 452 -> Remapped 272
+  Original 454 -> Remapped 273 |   Original 456 -> Remapped 274 |   Original 457 -> Remapped 275
+  Original 460 -> Remapped 276
+
+================================================================================
+ADJACENCY CONNECTIONS (Sample)
+================================================================================
+
+Each node connects to its neighbors. Showing connections for all nodes:
+
+Node   0 (remapped   0) connects to: [11, 37, 164, 267]
+Node   1 (remapped   1) connects to: [4, 19, 44, 274]
+Node   3 (remapped   2) connects to: [51, 195, 236]
+Node   4 (remapped   3) connects to: [1, 5, 44, 45, 51, 274, 275, 281]
+Node   5 (remapped   4) connects to: [4, 51, 195, 281]
+Node  11 (remapped   5) connects to: [0, 12, 37, 72, 267, 302]
+Node  12 (remapped   6) connects to: [11, 13, 38, 72, 268, 302]
+Node  13 (remapped   7) connects to: [12, 38, 82, 268, 312]
+Node  14 (remapped   8) connects to: [15, 86, 87, 316, 317]
+Node  15 (remapped   9) connects to: [14, 16, 85, 86, 315, 316]
+Node  16 (remapped  10) connects to: [15, 17, 85, 315]
+Node  17 (remapped  11) connects to: [16, 18, 83, 84, 85, 313, 314, 315]
+Node  18 (remapped  12) connects to: [17, 83, 200, 201, 313, 421]
+Node  19 (remapped  13) connects to: [1, 44, 125, 274, 354]
+Node  22 (remapped  14) connects to: [23, 230, 231]
+Node  23 (remapped  15) connects to: [22, 24, 229, 230]
+Node  24 (remapped  16) connects to: [23, 228, 229]
+Node  31 (remapped  17) connects to: [111, 117, 228]
+Node  32 (remapped  18) connects to: [140, 171, 194, 201, 208, 211]
+Node  36 (remapped  19) connects to: [100, 101, 142, 203, 205, 206]
+Node  37 (remapped  20) connects to: [0, 11, 39, 72, 164, 167]
+Node  38 (remapped  21) connects to: [12, 13, 41, 72, 81, 82]
+Node  39 (remapped  22) connects to: [37, 40, 72, 73, 92, 165, 167]
+Node  40 (remapped  23) connects to: [39, 73, 74, 92, 185, 186]
+Node  41 (remapped  24) connects to: [38, 42, 72, 73, 74, 81]
+Node  42 (remapped  25) connects to: [41, 74, 80, 81, 183, 184]
+Node  43 (remapped  26) connects to: [57, 61, 91, 106, 146, 202, 204]
+Node  44 (remapped  27) connects to: [1, 4, 19, 45, 125, 237]
+Node  45 (remapped  28) connects to: [4, 44, 51, 134]
+Node  47 (remapped  29) connects to: [100, 114, 121, 126, 128, 217]
+Node  50 (remapped  30) connects to: [101, 117, 118, 123, 187, 205]
+Node  51 (remapped  31) connects to: [3, 4, 5, 45, 134, 195, 236]
+Node  57 (remapped  32) connects to: [43, 61, 185, 186, 202, 212]
+Node  58 (remapped  33) connects to: [132, 172, 177, 215]
+Node  61 (remapped  34) connects to: [43, 57, 76, 146, 184, 185]
+Node  62 (remapped  35) connects to: [76, 77, 78, 96, 183, 191]
+Node  64 (remapped  36) connects to: [102, 129, 240]
+Node  72 (remapped  37) connects to: [11, 12, 37, 38, 39, 41, 73]
+Node  73 (remapped  38) connects to: [39, 40, 41, 72, 74]
+Node  74 (remapped  39) connects to: [40, 41, 42, 73, 184, 185]
+Node  76 (remapped  40) connects to: [61, 62, 77, 146, 183, 184]
+Node  77 (remapped  41) connects to: [62, 76, 90, 91, 96, 146]
+Node  78 (remapped  42) connects to: [62, 95, 96, 191]
+Node  80 (remapped  43) connects to: [42, 81, 183, 191]
+Node  81 (remapped  44) connects to: [38, 41, 42, 80, 82]
+Node  82 (remapped  45) connects to: [13, 38, 81]
+Node  83 (remapped  46) connects to: [17, 18, 84, 181, 182, 201]
+Node  84 (remapped  47) connects to: [17, 83, 85, 180, 181]
+Node  85 (remapped  48) connects to: [15, 16, 17, 84, 86, 179, 180]
+Node  86 (remapped  49) connects to: [14, 15, 85, 87, 178, 179]
+Node  87 (remapped  50) connects to: [14, 86, 178]
+Node  88 (remapped  51) connects to: [89, 95, 96, 178, 179]
+Node  89 (remapped  52) connects to: [88, 90, 96, 179, 180]
+Node  90 (remapped  53) connects to: [77, 89, 91, 96, 180, 181]
+Node  91 (remapped  54) connects to: [43, 77, 90, 106, 146, 181, 182]
+Node  92 (remapped  55) connects to: [39, 40, 165, 186, 206, 216]
+Node  93 (remapped  56) connects to: [132, 137]
+Node  95 (remapped  57) connects to: [78, 88, 96]
+Node  96 (remapped  58) connects to: [62, 77, 78, 88, 89, 90, 95]
+Node  97 (remapped  59) connects to: [99, 165, 167]
+Node  99 (remapped  60) connects to: [97, 240]
+Node 100 (remapped  61) connects to: [36, 47, 101, 120, 121, 126, 142]
+Node 101 (remapped  62) connects to: [36, 50, 100, 118, 119, 120, 205]
+Node 102 (remapped  63) connects to: [64, 129]
+Node 106 (remapped  64) connects to: [43, 91, 182, 194, 204]
+Node 111 (remapped  65) connects to: [31, 116, 117, 123]
+Node 114 (remapped  66) connects to: [47, 128, 217]
+Node 116 (remapped  67) connects to: [111, 123, 137]
+Node 117 (remapped  68) connects to: [31, 50, 111, 118, 123, 228, 229]
+Node 118 (remapped  69) connects to: [50, 101, 117, 119, 229, 230]
+Node 119 (remapped  70) connects to: [101, 118, 120, 230]
+Node 120 (remapped  71) connects to: [100, 101, 119, 121, 230, 231, 232]
+Node 121 (remapped  72) connects to: [47, 100, 120, 128, 232]
+Node 123 (remapped  73) connects to: [50, 111, 116, 117, 137, 147, 177, 187]
+Node 125 (remapped  74) connects to: [19, 44, 237]
+Node 126 (remapped  75) connects to: [47, 100, 129, 142, 209, 217]
+Node 128 (remapped  76) connects to: [47, 114, 121, 232]
+Node 129 (remapped  77) connects to: [64, 102, 126, 142, 203, 209]
+Node 132 (remapped  78) connects to: [58, 93, 137, 177]
+Node 134 (remapped  79) connects to: [45, 51, 236]
+Node 135 (remapped  80) connects to: [136, 138, 150, 169, 192, 214]
+Node 136 (remapped  81) connects to: [135, 138, 150, 172]
+Node 137 (remapped  82) connects to: [93, 116, 123, 132, 177]
+Node 138 (remapped  83) connects to: [135, 136, 172, 192, 213, 215]
+Node 140 (remapped  84) connects to: [32, 148, 170, 171, 176, 211]
+Node 142 (remapped  85) connects to: [36, 100, 126, 129, 203]
+Node 146 (remapped  86) connects to: [43, 61, 76, 77, 91]
+Node 147 (remapped  87) connects to: [123, 177, 187, 213, 215]
+Node 148 (remapped  88) connects to: [140, 152, 171, 175, 176]
+Node 149 (remapped  89) connects to: [150, 170, 176]
+Node 150 (remapped  90) connects to: [135, 136, 149, 169, 170]
+Node 152 (remapped  91) connects to: [148, 175, 377]
+Node 164 (remapped  92) connects to: [0, 37, 167, 267, 393]
+Node 165 (remapped  93) connects to: [39, 92, 97, 167, 203, 206]
+Node 167 (remapped  94) connects to: [37, 39, 97, 164, 165]
+Node 169 (remapped  95) connects to: [135, 150, 170, 210, 211, 214]
+Node 170 (remapped  96) connects to: [140, 149, 150, 169, 176, 211]
+Node 171 (remapped  97) connects to: [32, 140, 148, 175, 199, 208]
+Node 172 (remapped  98) connects to: [58, 136, 138, 215]
+Node 175 (remapped  99) connects to: [148, 152, 171, 199, 377, 396]
+Node 176 (remapped 100) connects to: [140, 148, 149, 170]
+Node 177 (remapped 101) connects to: [58, 123, 132, 137, 147, 215]
+Node 178 (remapped 102) connects to: [86, 87, 88, 179]
+Node 179 (remapped 103) connects to: [85, 86, 88, 89, 178, 180]
+Node 180 (remapped 104) connects to: [84, 85, 89, 90, 179, 181]
+Node 181 (remapped 105) connects to: [83, 84, 90, 91, 180, 182]
+Node 182 (remapped 106) connects to: [83, 91, 106, 181, 194, 201]
+Node 183 (remapped 107) connects to: [42, 62, 76, 80, 184, 191]
+Node 184 (remapped 108) connects to: [42, 61, 74, 76, 183, 185]
+Node 185 (remapped 109) connects to: [40, 57, 61, 74, 184, 186]
+Node 186 (remapped 110) connects to: [40, 57, 92, 185, 212, 216]
+Node 187 (remapped 111) connects to: [50, 123, 147, 192, 205, 207, 213, 214]
+Node 191 (remapped 112) connects to: [62, 78, 80, 183]
+Node 192 (remapped 113) connects to: [135, 138, 187, 213, 214]
+Node 194 (remapped 114) connects to: [32, 106, 182, 201, 204, 211]
+Node 195 (remapped 115) connects to: [3, 5, 51, 248, 281]
+Node 199 (remapped 116) connects to: [171, 175, 200, 208, 396, 428]
+Node 200 (remapped 117) connects to: [18, 199, 201, 208, 396, 421, 428]
+Node 201 (remapped 118) connects to: [18, 32, 83, 182, 194, 200, 208]
+Node 202 (remapped 119) connects to: [43, 57, 204, 210, 212, 214]
+Node 203 (remapped 120) connects to: [36, 129, 142, 165, 206]
+Node 204 (remapped 121) connects to: [43, 106, 194, 202, 210, 211]
+Node 205 (remapped 122) connects to: [36, 50, 101, 187, 206, 207, 216]
+Node 206 (remapped 123) connects to: [36, 92, 165, 203, 205, 216]
+Node 207 (remapped 124) connects to: [187, 205, 212, 214, 216]
+Node 208 (remapped 125) connects to: [32, 171, 199, 200, 201]
+Node 209 (remapped 126) connects to: [126, 129, 217]
+Node 210 (remapped 127) connects to: [169, 202, 204, 211, 214]
+Node 211 (remapped 128) connects to: [32, 140, 169, 170, 194, 204, 210]
+Node 212 (remapped 129) connects to: [57, 186, 202, 207, 214, 216]
+Node 213 (remapped 130) connects to: [138, 147, 187, 192, 215]
+Node 214 (remapped 131) connects to: [135, 169, 187, 192, 202, 207, 210, 212]
+Node 215 (remapped 132) connects to: [58, 138, 147, 172, 177, 213]
+Node 216 (remapped 133) connects to: [92, 186, 205, 206, 207, 212]
+Node 217 (remapped 134) connects to: [47, 114, 126, 209, 236]
+Node 228 (remapped 135) connects to: [24, 31, 117, 229]
+Node 229 (remapped 136) connects to: [23, 24, 117, 118, 228, 230]
+Node 230 (remapped 137) connects to: [22, 23, 118, 119, 120, 229, 231]
+Node 231 (remapped 138) connects to: [22, 120, 230, 232]
+Node 232 (remapped 139) connects to: [120, 121, 128, 231]
+Node 236 (remapped 140) connects to: [3, 51, 134, 217]
+Node 237 (remapped 141) connects to: [44, 125]
+Node 240 (remapped 142) connects to: [64, 99]
+Node 248 (remapped 143) connects to: [195, 281, 456]
+Node 252 (remapped 144) connects to: [253, 450, 451]
+Node 253 (remapped 145) connects to: [252, 254, 449, 450]
+Node 254 (remapped 146) connects to: [253, 448, 449]
+Node 261 (remapped 147) connects to: [340, 346, 448]
+Node 262 (remapped 148) connects to: [369, 396, 418, 421, 428, 431]
+Node 264 (remapped 149) connects to: [356, 368, 372, 383, 447, 454]
+Node 266 (remapped 150) connects to: [329, 330, 371, 423, 425, 426]
+Node 267 (remapped 151) connects to: [0, 11, 164, 269, 302, 393]
+Node 268 (remapped 152) connects to: [12, 13, 271, 302, 311, 312]
+Node 269 (remapped 153) connects to: [267, 270, 302, 303, 322, 391, 393]
+Node 270 (remapped 154) connects to: [269, 303, 304, 322, 409, 410]
+Node 271 (remapped 155) connects to: [268, 272, 302, 303, 304, 311]
+Node 272 (remapped 156) connects to: [271, 304, 310, 311, 407, 408]
+Node 273 (remapped 157) connects to: [287, 291, 321, 335, 375, 422, 424]
+Node 274 (remapped 158) connects to: [1, 4, 19, 275, 354, 440, 457]
+Node 275 (remapped 159) connects to: [4, 274, 281, 363, 440]
+Node 277 (remapped 160) connects to: [329, 343, 350, 355, 357, 437]
+Node 279 (remapped 161) connects to: [294, 331, 358, 429]
+Node 280 (remapped 162) connects to: [330, 346, 347, 352, 411, 425]
+Node 281 (remapped 163) connects to: [4, 5, 195, 248, 275, 363, 456]
+Node 287 (remapped 164) connects to: [273, 291, 409, 410, 422, 432]
+Node 288 (remapped 165) connects to: [361, 397, 401, 435]
+Node 291 (remapped 166) connects to: [273, 287, 306, 375, 408, 409]
+Node 292 (remapped 167) connects to: [306, 307, 308, 325, 407, 415]
+Node 294 (remapped 168) connects to: [279, 331, 358, 460]
+Node 302 (remapped 169) connects to: [11, 12, 267, 268, 269, 271, 303]
+Node 303 (remapped 170) connects to: [269, 270, 271, 302, 304]
+Node 304 (remapped 171) connects to: [270, 271, 272, 303, 408, 409]
+Node 306 (remapped 172) connects to: [291, 292, 307, 375, 407, 408]
+Node 307 (remapped 173) connects to: [292, 306, 320, 321, 325, 375]
+Node 308 (remapped 174) connects to: [292, 324, 325, 415]
+Node 310 (remapped 175) connects to: [272, 311, 407, 415]
+Node 311 (remapped 176) connects to: [268, 271, 272, 310, 312]
+Node 312 (remapped 177) connects to: [13, 268, 311]
+Node 313 (remapped 178) connects to: [17, 18, 314, 405, 406, 421]
+Node 314 (remapped 179) connects to: [17, 313, 315, 404, 405]
+Node 315 (remapped 180) connects to: [15, 16, 17, 314, 316, 403, 404]
+Node 316 (remapped 181) connects to: [14, 15, 315, 317, 402, 403]
+Node 317 (remapped 182) connects to: [14, 316, 402]
+Node 318 (remapped 183) connects to: [319, 324, 325, 402, 403]
+Node 319 (remapped 184) connects to: [318, 320, 325, 403, 404]
+Node 320 (remapped 185) connects to: [307, 319, 321, 325, 404, 405]
+Node 321 (remapped 186) connects to: [273, 307, 320, 335, 375, 405, 406]
+Node 322 (remapped 187) connects to: [269, 270, 391, 410, 426, 436]
+Node 323 (remapped 188) connects to: [361, 366, 447, 454]
+Node 324 (remapped 189) connects to: [308, 318, 325]
+Node 325 (remapped 190) connects to: [292, 307, 308, 318, 319, 320, 324]
+Node 326 (remapped 191) connects to: [328, 391, 393]
+Node 328 (remapped 192) connects to: [326, 460]
+Node 329 (remapped 193) connects to: [266, 277, 330, 349, 350, 355, 371]
+Node 330 (remapped 194) connects to: [266, 280, 329, 347, 348, 349, 425]
+Node 331 (remapped 195) connects to: [279, 294, 358]
+Node 335 (remapped 196) connects to: [273, 321, 406, 418, 424]
+Node 340 (remapped 197) connects to: [261, 345, 346, 352, 372]
+Node 343 (remapped 198) connects to: [277, 357, 437]
+Node 345 (remapped 199) connects to: [340, 352, 366, 372, 447]
+Node 346 (remapped 200) connects to: [261, 280, 340, 347, 352, 448, 449]
+Node 347 (remapped 201) connects to: [280, 330, 346, 348, 449, 450]
+Node 348 (remapped 202) connects to: [330, 347, 349, 450]
+Node 349 (remapped 203) connects to: [329, 330, 348, 350, 450, 451, 452]
+Node 350 (remapped 204) connects to: [277, 329, 349, 357, 452]
+Node 352 (remapped 205) connects to: [280, 340, 345, 346, 366, 376, 401, 411]
+Node 354 (remapped 206) connects to: [19, 274, 457]
+Node 355 (remapped 207) connects to: [277, 329, 358, 371, 429, 437]
+Node 356 (remapped 208) connects to: [264, 368, 389, 454]
+Node 357 (remapped 209) connects to: [277, 343, 350, 452]
+Node 358 (remapped 210) connects to: [279, 294, 331, 355, 371, 423, 429]
+Node 361 (remapped 211) connects to: [288, 323, 366, 401]
+Node 363 (remapped 212) connects to: [275, 281, 440, 456]
+Node 364 (remapped 213) connects to: [365, 367, 379, 394, 416, 434]
+Node 365 (remapped 214) connects to: [364, 367, 379, 397]
+Node 366 (remapped 215) connects to: [323, 345, 352, 361, 401, 447]
+Node 367 (remapped 216) connects to: [364, 365, 397, 416, 433, 435]
+Node 368 (remapped 217) connects to: [264, 356, 383, 389]
+Node 369 (remapped 218) connects to: [262, 377, 395, 396, 400, 431]
+Node 371 (remapped 219) connects to: [266, 329, 355, 358, 423]
+Node 372 (remapped 220) connects to: [264, 340, 345, 383, 447]
+Node 375 (remapped 221) connects to: [273, 291, 306, 307, 321]
+Node 376 (remapped 222) connects to: [352, 401, 411, 433, 435]
+Node 377 (remapped 223) connects to: [152, 175, 369, 396, 400]
+Node 378 (remapped 224) connects to: [379, 395, 400]
+Node 379 (remapped 225) connects to: [364, 365, 378, 394, 395]
+Node 383 (remapped 226) connects to: [264, 368, 372]
+Node 389 (remapped 227) connects to: [356, 368]
+Node 391 (remapped 228) connects to: [269, 322, 326, 393, 423, 426]
+Node 393 (remapped 229) connects to: [164, 267, 269, 326, 391]
+Node 394 (remapped 230) connects to: [364, 379, 395, 430, 431, 434]
+Node 395 (remapped 231) connects to: [369, 378, 379, 394, 400, 431]
+Node 396 (remapped 232) connects to: [175, 199, 200, 262, 369, 377, 428]
+Node 397 (remapped 233) connects to: [288, 365, 367, 435]
+Node 400 (remapped 234) connects to: [369, 377, 378, 395]
+Node 401 (remapped 235) connects to: [288, 352, 361, 366, 376, 435]
+Node 402 (remapped 236) connects to: [316, 317, 318, 403]
+Node 403 (remapped 237) connects to: [315, 316, 318, 319, 402, 404]
+Node 404 (remapped 238) connects to: [314, 315, 319, 320, 403, 405]
+Node 405 (remapped 239) connects to: [313, 314, 320, 321, 404, 406]
+Node 406 (remapped 240) connects to: [313, 321, 335, 405, 418, 421]
+Node 407 (remapped 241) connects to: [272, 292, 306, 310, 408, 415]
+Node 408 (remapped 242) connects to: [272, 291, 304, 306, 407, 409]
+Node 409 (remapped 243) connects to: [270, 287, 291, 304, 408, 410]
+Node 410 (remapped 244) connects to: [270, 287, 322, 409, 432, 436]
+Node 411 (remapped 245) connects to: [280, 352, 376, 416, 425, 427, 433, 434]
+Node 415 (remapped 246) connects to: [292, 308, 310, 407]
+Node 416 (remapped 247) connects to: [364, 367, 411, 433, 434]
+Node 418 (remapped 248) connects to: [262, 335, 406, 421, 424, 431]
+Node 421 (remapped 249) connects to: [18, 200, 262, 313, 406, 418, 428]
+Node 422 (remapped 250) connects to: [273, 287, 424, 430, 432, 434]
+Node 423 (remapped 251) connects to: [266, 358, 371, 391, 426]
+Node 424 (remapped 252) connects to: [273, 335, 418, 422, 430, 431]
+Node 425 (remapped 253) connects to: [266, 280, 330, 411, 426, 427, 436]
+Node 426 (remapped 254) connects to: [266, 322, 391, 423, 425, 436]
+Node 427 (remapped 255) connects to: [411, 425, 432, 434, 436]
+Node 428 (remapped 256) connects to: [199, 200, 262, 396, 421]
+Node 429 (remapped 257) connects to: [279, 355, 358, 437]
+Node 430 (remapped 258) connects to: [394, 422, 424, 431, 434]
+Node 431 (remapped 259) connects to: [262, 369, 394, 395, 418, 424, 430]
+Node 432 (remapped 260) connects to: [287, 410, 422, 427, 434, 436]
+Node 433 (remapped 261) connects to: [367, 376, 411, 416, 435]
+Node 434 (remapped 262) connects to: [364, 394, 411, 416, 422, 427, 430, 432]
+Node 435 (remapped 263) connects to: [288, 367, 376, 397, 401, 433]
+Node 436 (remapped 264) connects to: [322, 410, 425, 426, 427, 432]
+Node 437 (remapped 265) connects to: [277, 343, 355, 429, 456]
+Node 440 (remapped 266) connects to: [274, 275, 363, 457]
+Node 447 (remapped 267) connects to: [264, 323, 345, 366, 372, 454]
+Node 448 (remapped 268) connects to: [254, 261, 346, 449]
+Node 449 (remapped 269) connects to: [253, 254, 346, 347, 448, 450]
+Node 450 (remapped 270) connects to: [252, 253, 347, 348, 349, 449, 451]
+Node 451 (remapped 271) connects to: [252, 349, 450, 452]
+Node 452 (remapped 272) connects to: [349, 350, 357, 451]
+Node 454 (remapped 273) connects to: [264, 323, 356, 447]
+Node 456 (remapped 274) connects to: [248, 281, 363, 437]
+Node 457 (remapped 275) connects to: [274, 354, 440]
+Node 460 (remapped 276) connects to: [294, 328]
+
+================================================================================
+NODE COMPOSITION
+================================================================================
+
+The mouth partition includes:
+  - Lips nodes: 40 nodes
+  - Jaw nodes (left + right + chin): 37 nodes
+  - Cheek nodes (left + right): 20 nodes
+  - Nose anchor: 1 node (node 4)
+  - Additional connected nodes (via BFS): 179 nodes
+
+================================================================================
+NOTES
+================================================================================
+
+- All connections are derived from MediaPipe's default FACEMESH_TESSELATION
+- Only edges where both endpoints exist in the mouth partition are preserved
+- The graph is undirected (symmetric adjacency matrix)
+- Self-loops are included in the adjacency matrix
+- Original MediaPipe indices (0-467) are fixed landmark positions
+- Remapped indices (0-276) are used internally for efficient computation
+

@@ -71,12 +71,13 @@ class Trainer:
             'lr': []
         }
     
-    def train_epoch(self, gradient_clip: Optional[float] = None) -> Tuple[float, float]:
+    def train_epoch(self, gradient_clip: Optional[float] = None, log_gradients: bool = False) -> Tuple[float, float]:
         """
         Train for one epoch.
         
         Args:
             gradient_clip: Maximum gradient norm for clipping (optional)
+            log_gradients: Whether to log gradient statistics (for debugging)
         
         Returns:
             Tuple of (average_loss, accuracy)
@@ -86,6 +87,10 @@ class Trainer:
         total_loss = 0.0
         correct = 0
         total = 0
+        
+        # Gradient monitoring
+        grad_norms = []
+        logit_stats = {'mean': [], 'std': [], 'max': [], 'min': []}
         
         # Disable tqdm progress bar - only log at epoch completion
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch} [Train]", disable=True, miniters=len(self.train_loader))
@@ -102,8 +107,28 @@ class Trainer:
             outputs = self.model(features, adj, speech_mask)
             loss = self.criterion(outputs, labels)
             
+            # Log logit statistics (first batch only, for debugging)
+            if batch_idx == 0 and log_gradients:
+                with torch.no_grad():
+                    logit_stats['mean'].append(outputs.mean().item())
+                    logit_stats['std'].append(outputs.std().item())
+                    logit_stats['max'].append(outputs.max().item())
+                    logit_stats['min'].append(outputs.min().item())
+            
             # Backward pass
             loss.backward()
+            
+            # Monitor gradients (first batch only)
+            if batch_idx == 0 and log_gradients:
+                total_norm = 0.0
+                param_norm = 0.0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.data.norm(2)
+                        grad_norm = p.grad.data.norm(2)
+                        total_norm += grad_norm.item() ** 2
+                total_norm = total_norm ** (1. / 2)
+                grad_norms.append(total_norm)
             
             # Gradient clipping (if specified)
             if gradient_clip is not None:
@@ -119,6 +144,14 @@ class Trainer:
         
         avg_loss = total_loss / len(self.train_loader)
         accuracy = 100.0 * correct / total
+        
+        # Log gradient and logit stats (first epoch or when requested)
+        if log_gradients and grad_norms:
+            if self.logger:
+                self.logger.info(f"  Gradient norm: {grad_norms[0]:.6f}")
+                if logit_stats['mean']:
+                    self.logger.info(f"  Logits - mean: {logit_stats['mean'][0]:.3f}, std: {logit_stats['std'][0]:.3f}, "
+                                   f"max: {logit_stats['max'][0]:.3f}, min: {logit_stats['min'][0]:.3f}")
         
         return avg_loss, accuracy
     
@@ -199,15 +232,23 @@ class Trainer:
             self.current_epoch = epoch
             epoch_start_time = time.time()
             
-            # Train
-            train_loss, train_acc = self.train_epoch(gradient_clip=gradient_clip)
+            # Train (log gradients for first 3 epochs to debug)
+            log_gradients = (epoch <= 3)
+            train_loss, train_acc = self.train_epoch(
+                gradient_clip=gradient_clip,
+                log_gradients=log_gradients
+            )
             
             # Validate
             val_loss, val_acc = self.validate()
             
             # Update scheduler
             if self.scheduler:
-                self.scheduler.step()
+                # ReduceLROnPlateau needs val_loss, others just step
+                if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
             
             # Record history
             epoch_time = time.time() - epoch_start_time

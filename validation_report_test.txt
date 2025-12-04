@@ -1,0 +1,63 @@
+================================================================================
+PIPELINE VALIDATION REPORT
+================================================================================
+
+✅ PASSED - 001. DataLoader: mouth_train.pt
+--------------------------------------------------------------------------------
+DETAILS:
+  • num_classes: 100
+  • num_nodes: 277
+  • feature_dim: 5
+  • dataset_size: 33616
+  • batch_features_dtype: torch.float32
+  • batch_features_nan_count: 0
+  • batch_features_inf_count: 0
+  • batch_features_finite_count: 69250
+  • batch_size: 2
+  • max_frames: 25
+  • batch_n_nodes: 277
+  • batch_n_features: 5
+  • batch_speech_mask_dtype: torch.float32
+  • batch_speech_mask_nan_count: 0
+  • batch_speech_mask_inf_count: 0
+  • batch_speech_mask_finite_count: 50
+  • batch_speech_mask_range: (0.0, 1.0)
+  • batch_adjacency_dtype: torch.float32
+  • batch_adjacency_nan_count: 0
+  • batch_adjacency_inf_count: 0
+  • batch_adjacency_finite_count: 76729
+  • batch_labels_dtype: torch.int64
+  • label_range: (0, 0)
+
+✅ PASSED - 002. Model: gin_lstm_mamba
+--------------------------------------------------------------------------------
+DETAILS:
+  • model_name: gin_lstm_mamba
+  • in_features: 5
+  • num_classes: 100
+  • num_parameters: 6288228
+  • model_outputs_dtype: torch.float32
+  • model_outputs_nan_count: 0
+  • model_outputs_inf_count: 0
+  • model_outputs_finite_count: 200
+  • output_batch_size: 2
+  • output_num_classes: 100
+  • output_range: (-4.057500839233398, 2.7627687454223633)
+  • gradient_norm: 93.80913109068204
+  • params_with_grad: 63
+  • nan_gradients: 0
+  • inf_gradients: 0
+  • loss_value: 4.1026716232299805
+
+✅ PASSED - 003. Training Step
+--------------------------------------------------------------------------------
+DETAILS:
+  • loss_value: 4.460815906524658
+  • total_grad_norm: 81.41577540314002
+  • accuracy: 0.0
+
+================================================================================
+TOTAL CHECKS: 3
+✅ PASSED: 3
+❌ FAILED: 0
+================================================================================

@@ -36,6 +36,10 @@ def filter_model_config(model_name: str, model_config: Dict[str, Any]) -> Dict[s
         'graphsage_lstm': 'GraphSAGELSTMModel',
         'gnn_temporal_conv': 'GNNTemporalConvModel',
         'graphwavenet': 'GraphWaveNetModel',
+        'gin_lstm_mamba': 'GINLSTMMambaModel',
+        'gnn_lstm_mamba': 'GNNLSTMMambaModel',
+        'graphsage_lstm_mamba': 'GraphSAGELSTMMambaModel',
+        'adaptive_gcn_lstm_mamba': 'AdaptiveGCNLSTMMambaModel',
     }
     
     if model_name.lower() not in model_map:
@@ -90,6 +94,18 @@ def filter_model_config(model_name: str, model_config: Dict[str, Any]) -> Dict[s
     elif model_name.lower() == 'graphwavenet':
         from models.graphwavenet import GraphWaveNetModel
         model_class = GraphWaveNetModel
+    elif model_name.lower() == 'gin_lstm_mamba':
+        from models.gin_lstm_mamba import GINLSTMMambaModel
+        model_class = GINLSTMMambaModel
+    elif model_name.lower() == 'gnn_lstm_mamba':
+        from models.gnn_lstm_mamba import GNNLSTMMambaModel
+        model_class = GNNLSTMMambaModel
+    elif model_name.lower() == 'graphsage_lstm_mamba':
+        from models.graphsage_lstm_mamba import GraphSAGELSTMMambaModel
+        model_class = GraphSAGELSTMMambaModel
+    elif model_name.lower() == 'adaptive_gcn_lstm_mamba':
+        from models.adaptive_gcn_lstm_mamba import AdaptiveGCNLSTMMambaModel
+        model_class = AdaptiveGCNLSTMMambaModel
     else:
         raise ValueError(f"Unknown model: {model_name}")
     
@@ -122,7 +138,7 @@ def load_model_from_checkpoint(
     Returns:
         Loaded model with state dict applied
     """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     # Get model config from checkpoint
     model_config = checkpoint['model_config'].copy()
@@ -133,8 +149,15 @@ def load_model_from_checkpoint(
     # Create model
     model = get_model(model_name, **filtered_config)
     
-    # Load state dict
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Load state dict (use strict=False to handle missing keys from older checkpoints)
+    # This allows loading models saved before temporal_attention was added
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    
+    if missing_keys:
+        print(f"Warning: Missing keys in checkpoint (will use default initialization): {missing_keys}")
+    if unexpected_keys:
+        print(f"Warning: Unexpected keys in checkpoint (will be ignored): {unexpected_keys}")
+    
     model = model.to(device)
     model.eval()
     

@@ -10,11 +10,13 @@ import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
 import sys
+import numpy as np
 
 from utils import load_config, setup_logger, log_system_info, ensure_dir
 from utils.model_loader import filter_model_config
 from models import get_model
 from training import get_dataloader, Trainer
+from training.augmentations import create_augmentation_pipeline
 
 
 def main():
@@ -77,6 +79,22 @@ def main():
     logger.info(f"Val file: {val_file}")
     logger.info(f"Test file: {test_file}")
     
+    # Create augmentation pipeline (only for training)
+    augmentation_config = config.get('augmentation', {})
+    train_transform = create_augmentation_pipeline({
+        **augmentation_config,
+        'feature_level': feature_level
+    })
+    
+    if train_transform is not None:
+        logger.info("Augmentation enabled for training")
+        aug_list = []
+        for aug in train_transform.augmentations:
+            aug_list.append(f"{aug.__class__.__name__} (p={aug.p})")
+        logger.info(f"  Augmentations: {', '.join(aug_list)}")
+    else:
+        logger.info("No augmentation (disabled or not configured)")
+    
     # Create data loaders with incremental loading
     train_loader = get_dataloader(
         train_file,
@@ -84,7 +102,8 @@ def main():
         shuffle=True,
         num_workers=config['training'].get('num_workers', None),
         feature_level=feature_level,
-        feature_dir=str(feature_dir)
+        feature_dir=str(feature_dir),
+        transform=train_transform  # Augmentation only for training
     )
     
     val_loader = get_dataloader(
@@ -93,7 +112,8 @@ def main():
         shuffle=False,
         num_workers=config['training'].get('num_workers', None),
         feature_level=feature_level,
-        feature_dir=str(feature_dir)
+        feature_dir=str(feature_dir),
+        transform=None  # No augmentation for validation
     )
     
     test_loader = get_dataloader(
@@ -102,7 +122,8 @@ def main():
         shuffle=False,
         num_workers=config['training'].get('num_workers', None),
         feature_level=feature_level,
-        feature_dir=str(feature_dir)
+        feature_dir=str(feature_dir),
+        transform=None  # No augmentation for test
     )
     
     # Get dataset info
@@ -118,13 +139,18 @@ def main():
     logger.info(f"Val samples: {len(val_loader.dataset)}")
     logger.info(f"Test samples: {len(test_loader.dataset)}")
     
+    # Class weights and focal loss are disabled per user request
+    use_class_weights = False
+    use_focal_loss = False
+    class_weights = None
+    
     # Build model
     logger.info("Building model...")
     model_config = config['model']
     model_config['params']['in_features'] = in_features
     model_config['params']['num_classes'] = num_classes
-    # Auto-fill num_nodes for adaptive_gcn if not provided
-    if model_name == 'adaptive_gcn' and 'num_nodes' not in model_config['params']:
+    # Auto-fill num_nodes for adaptive models if not provided
+    if model_name in ['adaptive_gcn', 'adaptive_gcn_lstm', 'adaptive_gcn_lstm_mamba'] and 'num_nodes' not in model_config['params']:
         model_config['params']['num_nodes'] = num_nodes
         logger.info(f"Auto-filled num_nodes: {num_nodes}")
     
@@ -136,13 +162,15 @@ def main():
     logger.info(f"Model: {model_name}")
     logger.info(f"Parameters: {model.count_parameters():,}")
     
-    # Loss function with optional label smoothing
+    # Loss function - standard CrossEntropyLoss (no class weights or focal loss)
     label_smoothing = config['training'].get('label_smoothing', 0.0)
+    
     if label_smoothing > 0:
         criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         logger.info(f"Using label smoothing: {label_smoothing}")
     else:
         criterion = nn.CrossEntropyLoss()
+        logger.info("Using standard CrossEntropyLoss")
     
     # Optimizer
     optimizer_name = config['training']['optimizer'].lower()
@@ -176,6 +204,50 @@ def main():
             T_max = config['training']['epochs']
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max)
             logger.info(f"Scheduler: CosineAnnealingLR (T_max={T_max})")
+        elif scheduler_name == 'reduceonplateau':
+            mode = scheduler_config.get('mode', 'min')
+            factor = float(scheduler_config.get('factor', 0.5))
+            patience = int(scheduler_config.get('patience', 5))
+            min_lr = scheduler_config.get('min_lr', 1e-6)
+            # Convert min_lr to float if it's a string (e.g., "1e-6" from YAML)
+            if isinstance(min_lr, str):
+                min_lr = float(min_lr)
+            else:
+                min_lr = float(min_lr)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode=mode, factor=factor, patience=patience, min_lr=min_lr
+            )
+            logger.info(f"Scheduler: ReduceLROnPlateau (mode={mode}, factor={factor}, patience={patience}, min_lr={min_lr})")
+        elif scheduler_name == 'cosinewarmrestarts':
+            T_0 = scheduler_config.get('T_0', 10)  # First restart period
+            T_mult = scheduler_config.get('T_mult', 2)  # Period multiplier
+            eta_min = scheduler_config.get('eta_min', 1e-6)  # Minimum learning rate
+            scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min
+            )
+            logger.info(f"Scheduler: CosineAnnealingWarmRestarts (T_0={T_0}, T_mult={T_mult}, eta_min={eta_min})")
+        elif scheduler_name == 'warmup':
+            # Warmup + CosineAnnealingLR
+            warmup_epochs = scheduler_config.get('warmup_epochs', 5)
+            T_max = config['training']['epochs'] - warmup_epochs
+            eta_min = float(scheduler_config.get('eta_min', 1e-6))
+            if isinstance(eta_min, str):
+                eta_min = float(eta_min)
+            
+            # Create a lambda scheduler for warmup
+            def lr_lambda(epoch):
+                if epoch < warmup_epochs:
+                    # Linear warmup: gradually increase from 0 to 1
+                    return (epoch + 1) / warmup_epochs
+                else:
+                    # Cosine annealing after warmup
+                    adjusted_epoch = epoch - warmup_epochs
+                    cosine_factor = 0.5 * (1 + np.cos(np.pi * adjusted_epoch / T_max))
+                    # Scale from eta_min/lr to 1.0
+                    return eta_min / lr + (1 - eta_min / lr) * cosine_factor
+            
+            scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            logger.info(f"Scheduler: Warmup ({warmup_epochs} epochs) + CosineAnnealingLR (T_max={T_max}, eta_min={eta_min})")
     
     # Define callback to save metadata after each epoch
     def save_metadata_callback(epoch, save_dir, metrics):
@@ -257,9 +329,14 @@ def main():
     logger.info("EVALUATING ON TEST SET")
     logger.info("=" * 60)
     
-    # Load best model
-    checkpoint = torch.load(output_dir / 'best.pth')
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Load best model (use strict=False to handle missing keys from older checkpoints)
+    checkpoint = torch.load(output_dir / 'best.pth', weights_only=False)
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    
+    if missing_keys:
+        logger.warning(f"Missing keys when loading checkpoint (will use default initialization): {missing_keys}")
+    if unexpected_keys:
+        logger.warning(f"Unexpected keys in checkpoint (will be ignored): {unexpected_keys}")
     
     # Test
     trainer.model = model

@@ -29,7 +29,7 @@ def main():
         print(f"History file not found: {history_file}")
         return
     
-    history = torch.load(history_file)
+    history = torch.load(history_file, weights_only=False)
     
     # Create figure with subplots
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
