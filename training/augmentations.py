@@ -247,68 +247,218 @@ class HorizontalFlip(FaceAwareAugmentation):
         return features, speech_mask
 
 
-class FaceOrientationAwareAugmentation(FaceAwareAugmentation):
+class FaceRotation(FaceAwareAugmentation):
     """
-    Augmentation that considers face orientation (left/right facing).
-    Detects face orientation from landmark positions and applies orientation-aware augmentations.
+    Face rotation augmentation (2D rotation around face center).
+    Rotates landmarks around the face center point.
+    Handles B0 (x,y), B1 (vx,vy), and updates velocities correctly.
     """
-    def __init__(self, p: float = 0.5, feature_level: str = 'B0'):
+    def __init__(self, p: float = 0.5, max_angle_deg: float = 15.0):
         """
         Args:
             p: Probability of applying augmentation
-            feature_level: Feature level to determine if we have spatial coordinates
+            max_angle_deg: Maximum rotation angle in degrees (±max_angle_deg)
         """
         super().__init__(p)
-        self.feature_level = feature_level
-    
-    def _detect_face_orientation(self, features: torch.Tensor) -> str:
-        """
-        Detect if face is facing left or right based on landmark positions.
-        Uses first frame's x-coordinates (B0 feature index 0).
-        
-        Returns:
-            'left', 'right', or 'center'
-        """
-        if features.shape[2] < 2:
-            return 'center'
-        
-        # Use first frame's x-coordinates
-        x_coords = features[0, :, 0]  # (nodes,)
-        
-        # Compute center of mass in x-direction
-        x_center = x_coords.mean().item()
-        
-        # Heuristic: if center < 0.5, face is on left side (facing right)
-        # if center > 0.5, face is on right side (facing left)
-        if x_center < 0.45:
-            return 'right'  # Face on left, facing right
-        elif x_center > 0.55:
-            return 'left'   # Face on right, facing left
-        else:
-            return 'center'
+        self.max_angle_deg = max_angle_deg
     
     def apply(self, features: torch.Tensor, speech_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Detect orientation
-        orientation = self._detect_face_orientation(features)
-        
-        # Apply orientation-specific augmentation
-        # For now, just apply small rotation-like transformation based on orientation
-        # This is a placeholder - can be extended with more sophisticated transformations
+        # Only works if we have B0 features (x, y coordinates)
+        if features.shape[2] < 2:
+            return features, speech_mask
         
         # Convert to float32 if needed
         was_float16 = features.dtype == torch.float16
         if was_float16:
             features = features.float()
         
-        # Small translation based on orientation (simulates slight rotation)
+        # Random rotation angle
+        angle_deg = random.uniform(-self.max_angle_deg, self.max_angle_deg)
+        angle_rad = np.deg2rad(angle_deg)
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
+        
+        # Compute face center (mean of all landmarks, all frames)
+        x_coords = features[:, :, 0]  # (frames, nodes)
+        y_coords = features[:, :, 1]  # (frames, nodes)
+        center_x = x_coords.mean().item()
+        center_y = y_coords.mean().item()
+        
+        # Rotate coordinates around center
+        x_centered = x_coords - center_x
+        y_centered = y_coords - center_y
+        
+        # Apply rotation matrix
+        x_rotated = x_centered * cos_a - y_centered * sin_a
+        y_rotated = x_centered * sin_a + y_centered * cos_a
+        
+        # Translate back
+        features[:, :, 0] = x_rotated + center_x
+        features[:, :, 1] = y_rotated + center_y
+        
+        # If B1 features exist (vx, vy at indices 2, 3), rotate velocities
+        if features.shape[2] >= 4:
+            vx = features[:, :, 2]  # (frames, nodes)
+            vy = features[:, :, 3]  # (frames, nodes)
+            
+            # Rotate velocity vectors
+            vx_rotated = vx * cos_a - vy * sin_a
+            vy_rotated = vx * sin_a + vy * cos_a
+            
+            features[:, :, 2] = vx_rotated
+            features[:, :, 3] = vy_rotated
+        
+        # Convert back to float16 if original was float16
+        if was_float16:
+            features = features.half()
+        
+        return features, speech_mask
+
+
+class FaceTranslation(FaceAwareAugmentation):
+    """
+    Small random translation of face landmarks.
+    Simulates slight head movement or camera shift.
+    """
+    def __init__(self, p: float = 0.5, max_translation: float = 0.02):
+        """
+        Args:
+            p: Probability of applying augmentation
+            max_translation: Maximum translation in normalized coordinates (0-1 range)
+        """
+        super().__init__(p)
+        self.max_translation = max_translation
+    
+    def apply(self, features: torch.Tensor, speech_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if features.shape[2] < 2:
+            return features, speech_mask
+        
+        # Convert to float32 if needed
+        was_float16 = features.dtype == torch.float16
+        if was_float16:
+            features = features.float()
+        
+        # Random translation
+        tx = random.uniform(-self.max_translation, self.max_translation)
+        ty = random.uniform(-self.max_translation, self.max_translation)
+        
+        # Apply translation to coordinates
+        features[:, :, 0] = features[:, :, 0] + tx
+        features[:, :, 1] = features[:, :, 1] + ty
+        
+        # Clamp to [0, 1] range (normalized coordinates)
+        features[:, :, 0] = torch.clamp(features[:, :, 0], 0.0, 1.0)
+        features[:, :, 1] = torch.clamp(features[:, :, 1], 0.0, 1.0)
+        
+        # Convert back to float16 if original was float16
+        if was_float16:
+            features = features.half()
+        
+        return features, speech_mask
+
+
+class FaceOrientationAwareAugmentation(FaceAwareAugmentation):
+    """
+    Augmentation that considers face orientation (left/right facing).
+    Detects face orientation from landmark positions and applies orientation-aware augmentations.
+    Enhanced version with better rotation handling.
+    """
+    def __init__(self, p: float = 0.5, max_rotation_deg: float = 10.0):
+        """
+        Args:
+            p: Probability of applying augmentation
+            max_rotation_deg: Maximum rotation angle for orientation correction
+        """
+        super().__init__(p)
+        self.max_rotation_deg = max_rotation_deg
+    
+    def _detect_face_orientation(self, features: torch.Tensor) -> Tuple[str, float]:
+        """
+        Detect if face is facing left or right based on landmark positions.
+        Uses first frame's x-coordinates (B0 feature index 0).
+        
+        Returns:
+            ('left', 'right', or 'center', angle_estimate)
+        """
+        if features.shape[2] < 2:
+            return 'center', 0.0
+        
+        # Use first frame's x-coordinates
+        x_coords = features[0, :, 0]  # (nodes,)
+        y_coords = features[0, :, 1]  # (nodes,)
+        
+        # Compute center of mass
+        center_x = x_coords.mean().item()
+        center_y = y_coords.mean().item()
+        
+        # Compute asymmetry: compare left and right sides
+        # For mouth partition, we can use x-coordinate distribution
+        x_std = x_coords.std().item()
+        
+        # Heuristic: if center < 0.45, face is on left side (facing right)
+        # if center > 0.55, face is on right side (facing left)
+        if center_x < 0.45:
+            orientation = 'right'  # Face on left, facing right
+            # Estimate rotation angle based on deviation
+            angle = min(15.0, (0.5 - center_x) * 30.0)  # Scale to degrees
+        elif center_x > 0.55:
+            orientation = 'left'   # Face on right, facing left
+            angle = min(15.0, (center_x - 0.5) * 30.0)
+        else:
+            orientation = 'center'
+            angle = 0.0
+        
+        return orientation, angle
+    
+    def apply(self, features: torch.Tensor, speech_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Detect orientation
+        orientation, estimated_angle = self._detect_face_orientation(features)
+        
+        if orientation == 'center':
+            return features, speech_mask
+        
+        # Convert to float32 if needed
+        was_float16 = features.dtype == torch.float16
+        if was_float16:
+            features = features.float()
+        
+        # Apply small rotation to normalize orientation
+        # Use smaller rotation than estimated to avoid over-correction
+        correction_angle_deg = min(estimated_angle * 0.3, self.max_rotation_deg)
+        correction_angle_rad = np.deg2rad(correction_angle_deg)
+        cos_a = np.cos(correction_angle_rad)
+        sin_a = np.sin(correction_angle_rad)
+        
+        # Rotate in opposite direction to normalize
         if orientation == 'left':
-            # Slight shift to compensate for left-facing
-            if features.shape[2] >= 2:
-                features[:, :, 0] = features[:, :, 0] + 0.01  # Small right shift
+            sin_a = -sin_a  # Rotate right to normalize
         elif orientation == 'right':
-            # Slight shift to compensate for right-facing
-            if features.shape[2] >= 2:
-                features[:, :, 0] = features[:, :, 0] - 0.01  # Small left shift
+            sin_a = sin_a   # Rotate left to normalize
+        
+        # Compute face center
+        x_coords = features[:, :, 0]
+        y_coords = features[:, :, 1]
+        center_x = x_coords.mean().item()
+        center_y = y_coords.mean().item()
+        
+        # Apply rotation
+        x_centered = x_coords - center_x
+        y_centered = y_coords - center_y
+        
+        x_rotated = x_centered * cos_a - y_centered * sin_a
+        y_rotated = x_centered * sin_a + y_centered * cos_a
+        
+        features[:, :, 0] = x_rotated + center_x
+        features[:, :, 1] = y_rotated + center_y
+        
+        # Rotate velocities if B1 features exist
+        if features.shape[2] >= 4:
+            vx = features[:, :, 2]
+            vy = features[:, :, 3]
+            vx_rotated = vx * cos_a - vy * sin_a
+            vy_rotated = vx * sin_a + vy * cos_a
+            features[:, :, 2] = vx_rotated
+            features[:, :, 3] = vy_rotated
         
         # Convert back to float16 if original was float16
         if was_float16:
@@ -408,12 +558,28 @@ def create_augmentation_pipeline(config: Dict) -> Optional[CompositeAugmentation
             feature_level=feature_level
         ))
     
+    # Face rotation
+    if 'face_rotation' in aug_config:
+        aug_params = aug_config['face_rotation']
+        augmentations.append(FaceRotation(
+            p=aug_params.get('p', 0.5),
+            max_angle_deg=aug_params.get('max_angle_deg', 15.0)
+        ))
+    
+    # Face translation
+    if 'face_translation' in aug_config:
+        aug_params = aug_config['face_translation']
+        augmentations.append(FaceTranslation(
+            p=aug_params.get('p', 0.5),
+            max_translation=aug_params.get('max_translation', 0.02)
+        ))
+    
     # Face orientation aware
     if 'face_orientation' in aug_config:
         aug_params = aug_config['face_orientation']
         augmentations.append(FaceOrientationAwareAugmentation(
             p=aug_params.get('p', 0.5),
-            feature_level=feature_level
+            max_rotation_deg=aug_params.get('max_rotation_deg', 10.0)
         ))
     
     if not augmentations:

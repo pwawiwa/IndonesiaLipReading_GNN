@@ -25,11 +25,11 @@ FPS=25
 # Target feature levels - will run for each level
 # CUMULATIVE FEATURE COUNTS (each file contains all previous levels):
 #   B0: 2 features (x, y)
-#   B1: 5 features (B0: 2 + B1: 3 = vx, vy, speed)
-#   B2: 7 features (B0: 2 + B1: 3 + B2: 2 = distance, angle)
+#   B1: 7 features (B0: 2 + B1: 5 = vx, vy, speed, ax, ay)
+#   B2: 15 features (B0: 2 + B1: 5 + B2: 8 = MAR, lip_width, lip_height, jaw_height, cheek_puff, lip_curvature, lip_corner_angle, jaw_opening) - computed directly from extracted data
 #   B3: 11 features (B0: 2 + B1: 3 + B2: 2 + B3: 4 = AU features)
 # Best model used B2 (geometric features), so we'll try both B1 and B2
-TARGET_FEATURE_LEVELS=("B1")  # Run for B1 and B2 feature levels (B2 was best for full partition)
+TARGET_FEATURE_LEVELS=("B2")  # Run for B1 and B2 feature levels (B2 was best for full partition)
 
 # Models for mouth partition with B1 features:
 # - All LSTM models: gin_lstm, gnn_lstm, graphsage_lstm, adaptive_gcn_lstm
@@ -41,7 +41,7 @@ MODELS=("gin_lstm_mamba" "gnn_lstm_mamba" "graphsage_lstm_mamba" "adaptive_gcn_l
 # BEST CONFIG: Optimal hyperparameters for best performance
 BATCH_SIZE=32  # Best config: optimal batch size
 HIDDEN_DIM=256  # Best config: optimal hidden dimension
-NUM_EPOCHS=${EPOCHS:-100}  # Best config: 100 epochs (can be overridden by EPOCHS env var)
+NUM_EPOCHS=${EPOCHS:-150}  # 150 epochs (no early stopping)
 NUM_WORKERS=0  # Set to 0 to avoid memory duplication across workers
 LEARNING_RATE=0.0001  # Best config: matches best model (gin_lstm_mamba used 0.0001)
 WEIGHT_DECAY=0.0001   # Best config: matches best model (gin_lstm_mamba used 0.0001)
@@ -162,7 +162,7 @@ ensure_prerequisites() {
             levels_needed=("B0" "B1")  # B1 file contains B0+B1, but needs B0 to compute
             ;;
         "B2")
-            levels_needed=("B0" "B1" "B2")  # B2 file contains B0+B1+B2, but needs B1 to compute
+            levels_needed=("B2")  # B2 file contains B0+B1+B2, computed directly from extracted data (no B0/B1 files needed)
             ;;
         "B3")
             levels_needed=("B0" "B1" "B2" "B3")  # B3 file contains B0+B1+B2+B3, but needs B2 to compute
@@ -299,23 +299,24 @@ for split in splits_order:
     print(f"Processing {split} split sequentially...")
     # OPTIMIZATION: Pass previous level feature paths for faster computation
     # Each level now stores cumulative features (B1 has B0+B1, B2 has B0+B1+B2, etc.)
+    # B2 can be computed directly from extracted data without needing B0/B1 files
     b0_features_path = None
     b1_features_path = None
     b2_features_path = None
     
     if '${feature_set}' == 'B1':
+        # B1 can optionally use B0 for speedup, but can compute directly from landmarks
         b0_features_path = output_base.parent / 'B0' / f'${PARTITION}_{split}.pt'
         if not b0_features_path.exists():
             b0_features_path = None
     elif '${feature_set}' == 'B2':
-        b1_features_path = output_base.parent / 'B1' / f'${PARTITION}_{split}.pt'
-        if not b1_features_path.exists():
-            b1_features_path = None
-            # Fallback to B0 if B1 not available
-            b0_features_path = output_base.parent / 'B0' / f'${PARTITION}_{split}.pt'
-            if not b0_features_path.exists():
-                b0_features_path = None
+        # B2 computes B0+B1+B2 directly from extracted data (landmarks) in one pass
+        # No need to load B0/B1 files - everything computed on-the-fly
+        # Optional: can use B1/B0 files for speedup if available, but not required
+        b1_features_path = None  # Don't require B1 file - compute directly
+        b0_features_path = None  # Don't require B0 file - compute directly
     elif '${feature_set}' == 'B3':
+        # B3 can optionally use B2 for speedup, but can compute directly from landmarks
         b2_features_path = output_base.parent / 'B2' / f'${PARTITION}_{split}.pt'
         if not b2_features_path.exists():
             b2_features_path = None
@@ -558,12 +559,18 @@ training:
     name: reduceonplateau  # Best config: matches best model (gin_lstm_mamba used reduceonplateau)
     mode: min
     factor: 0.7
-    patience: 5
+    patience: 25
     min_lr: 1e-6
-  early_stopping_patience: 25  # Best config: matches best model (gin_lstm_mamba used 10)
+  early_stopping_patience: 999999  # Disabled: set to very large value (no early stopping)
   gradient_clip: ${GRADIENT_CLIP}
   label_smoothing: 0.0  # Best config: matches best model (gin_lstm_mamba used 0.0)
   num_workers: ${NUM_WORKERS}
+  balance_classes: false  # Disable class balancing (best config didn't use it)
+  balance_factor: 1.0  # Not used when balance_classes=false
+
+# Augmentation configuration - DISABLED (best config didn't use augmentation)
+augmentation:
+  enabled: false  # Best config: no augmentation
 EOF
     
     # Run training
@@ -632,7 +639,7 @@ log "Total scenarios: $((${#MODELS[@]} * ${#TARGET_FEATURE_LEVELS[@]}))"
 log "Model capacity: HIDDEN_DIM=${HIDDEN_DIM} (doubled from best config), BATCH_SIZE=${BATCH_SIZE}, increased layers (3 GIN/GCN, 2 LSTM/GRU)"
 log "Processing: Will preprocess prerequisites for each level if needed"
 log "Training: Each B level file contains cumulative features (no concatenation needed)"
-log "Cumulative feature counts: B0=2, B1=5 (B0+B1), B2=7 (B0+B1+B2), B3=11 (B0+B1+B2+B3)"
+log "Cumulative feature counts: B0=2, B1=7 (B0+B1), B2=15 (B0+B1+B2), B3=19 (B0+B1+B2+B3)"
 log "Memory optimization: Acceleration removed from B1, 1 anchor+no ratio in B2, PCA/motion removed from B3"
 log "="*80
 
@@ -690,8 +697,8 @@ for TARGET_FEATURE_LEVEL in "${TARGET_FEATURE_LEVELS[@]}"; do
         # Calculate total features for this level (cumulative)
         case "${TARGET_FEATURE_LEVEL}" in
             "B0") total_features=2 ;;
-            "B1") total_features=5 ;;  # B0(2) + B1(3)
-            "B2") total_features=7 ;;  # B0(2) + B1(3) + B2(2)
+            "B1") total_features=7 ;;  # B0(2) + B1(5) = vx, vy, speed, ax, ay
+            "B2") total_features=15 ;;  # B0(2) + B1(5) + B2(8) - computed directly from extracted data
             "B3") total_features=11 ;; # B0(2) + B1(3) + B2(2) + B3(4)
             *) total_features="unknown" ;;
         esac

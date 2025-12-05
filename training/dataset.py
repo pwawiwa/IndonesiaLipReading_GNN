@@ -2,10 +2,12 @@
 Dataset and DataLoader for lip reading.
 """
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import os
+from collections import Counter
+import numpy as np
 
 
 class LipReadingDataset(Dataset):
@@ -80,6 +82,20 @@ class LipReadingDataset(Dataset):
         
         # Build video list (just IDs, not data)
         self.video_ids = list(data['videos'].keys())
+        
+        # Build video_to_word mapping for class balancing
+        # Word is stored directly in video data
+        self.video_to_word = {}
+        for vid_id, vid_data in data['videos'].items():
+            if 'word' in vid_data:
+                self.video_to_word[vid_id] = vid_data['word']
+            else:
+                # Fallback: find word from label
+                label = vid_data['label']
+                for word, word_label in self.word_to_label.items():
+                    if word_label == label:
+                        self.video_to_word[vid_id] = word
+                        break
         
         if lazy_load:
             # Store file path and load videos on-demand
@@ -245,6 +261,93 @@ def collate_fn(batch: List) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, t
     return padded_features, padded_masks, adjacency, labels
 
 
+def create_balanced_sampler(
+    dataset: LipReadingDataset,
+    balance_factor: float = 1.0
+) -> Optional[WeightedRandomSampler]:
+    """
+    Create WeightedRandomSampler to oversample minority classes only.
+    Majority classes keep their original frequency (not reduced).
+    
+    Args:
+        dataset: Dataset instance
+        balance_factor: Balance factor (1.0 = full oversample to max, 0.5 = half oversample, etc.)
+                       Controls how much to oversample minority classes.
+                       Example: 0.5 means oversample minorities to max_count * 0.5
+        
+    Returns:
+        WeightedRandomSampler or None if balancing not needed
+    """
+    # Count class frequencies
+    class_counts = Counter()
+    for video_id in dataset.video_ids:
+        word = dataset.video_to_word.get(video_id)
+        if word:
+            label = dataset.word_to_label[word]
+            class_counts[label] += 1
+    
+    if not class_counts:
+        return None
+    
+    max_count = max(class_counts.values())
+    num_classes = len(dataset.word_to_label)
+    
+    # Check if balancing is needed (if all classes have same count, no need)
+    if len(set(class_counts.values())) == 1:
+        return None
+    
+    # Create weights:
+    # - Majority classes (count == max_count): weight = 1.0 (keep original frequency)
+    # - Minority classes (count < max_count): weight = max_count / count (oversample)
+    weights = []
+    for idx in range(len(dataset.video_ids)):
+        video_id = dataset.video_ids[idx]
+        word = dataset.video_to_word.get(video_id)
+        if word:
+            label = dataset.word_to_label[word]
+            count = class_counts[label]
+            if count == max_count:
+                # Majority class: keep original frequency (weight = 1.0)
+                weight = 1.0
+            else:
+                # Minority class: oversample to match max_count
+                # Apply balance_factor to control oversampling amount
+                target_count = int(max_count * balance_factor)
+                if target_count > count:
+                    weight = target_count / count if count > 0 else 1.0
+                else:
+                    weight = 1.0  # Don't undersample if balance_factor is too low
+            weights.append(weight)
+        else:
+            weights.append(1.0)
+    
+    # Calculate num_samples:
+    # Original size (all classes at original frequency) + oversampled minorities
+    original_size = len(dataset.video_ids)
+    
+    # Calculate additional samples needed for minority classes
+    additional_samples = 0
+    target_count = int(max_count * balance_factor)
+    for label, count in class_counts.items():
+        if count < max_count and target_count > count:
+            # This minority class needs oversampling
+            additional_samples += (target_count - count)
+    
+    num_samples = original_size + additional_samples
+    
+    # Ensure num_samples is at least original_size
+    if num_samples < original_size:
+        num_samples = original_size
+    
+    sampler = WeightedRandomSampler(
+        weights=weights,
+        num_samples=num_samples,
+        replacement=True  # Allow sampling same sample multiple times
+    )
+    
+    return sampler
+
+
 def get_dataloader(
     feature_file: str,
     batch_size: int = 32,
@@ -253,7 +356,9 @@ def get_dataloader(
     pin_memory: bool = True,
     feature_level: Optional[str] = None,
     feature_dir: Optional[str] = None,
-    transform: Optional[callable] = None
+    transform: Optional[callable] = None,
+    balance_classes: bool = False,
+    balance_factor: float = 1.0
 ) -> DataLoader:
     """
     Get DataLoader for feature file.
@@ -261,11 +366,15 @@ def get_dataloader(
     Args:
         feature_file: Path to feature .pt file (filename only, e.g., 'full_train.pt')
         batch_size: Batch size
-        shuffle: Whether to shuffle data
+        shuffle: Whether to shuffle data (ignored if balance_classes=True)
         num_workers: Number of workers (default: 50% of CPU cores)
         pin_memory: Pin memory for faster GPU transfer
         feature_level: Target feature level (B0, B1, B2, B3). If provided, loads incrementally.
         feature_dir: Base feature directory (e.g., 'data/features'). Required if feature_level is provided.
+        transform: Optional transform/augmentation function
+        balance_classes: If True, use WeightedRandomSampler to balance classes to max count
+        balance_factor: Balance factor (1.0 = full balance to max, 0.5 = half balance)
+                        Reduces training time. Default: 1.0 (full balance)
         
     Returns:
         DataLoader instance
@@ -276,6 +385,13 @@ def get_dataloader(
         feature_dir=feature_dir,
         transform=transform
     )
+    
+    # Create balanced sampler if requested
+    sampler = None
+    if balance_classes:
+        sampler = create_balanced_sampler(dataset, balance_factor=balance_factor)
+        if sampler is not None:
+            shuffle = False  # Can't shuffle when using sampler
     
     # Limit CPU usage and reduce memory: use fewer workers or 0 for memory-constrained systems
     # With num_workers > 0, each worker loads its own copy of data (multiplies memory usage)
@@ -288,7 +404,8 @@ def get_dataloader(
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory if num_workers == 0 else False,  # pin_memory only useful with workers

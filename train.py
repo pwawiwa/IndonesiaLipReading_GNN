@@ -96,6 +96,10 @@ def main():
         logger.info("No augmentation (disabled or not configured)")
     
     # Create data loaders with incremental loading
+    # Enable class balancing: oversample minority classes to match max class count
+    balance_classes = config['training'].get('balance_classes', False)
+    balance_factor = config['training'].get('balance_factor', 1.0)  # 1.0 = full balance, 0.5 = half balance
+    
     train_loader = get_dataloader(
         train_file,
         batch_size=config['training']['batch_size'],
@@ -103,8 +107,17 @@ def main():
         num_workers=config['training'].get('num_workers', None),
         feature_level=feature_level,
         feature_dir=str(feature_dir),
-        transform=train_transform  # Augmentation only for training
+        transform=train_transform,  # Augmentation only for training
+        balance_classes=balance_classes,  # Balance classes to max count
+        balance_factor=balance_factor  # Balance factor (1.0 = full, 0.5 = half, etc.)
     )
+    
+    if balance_classes:
+        logger.info(f"Class balancing enabled: oversampling minority classes (factor={balance_factor:.2f})")
+        if train_loader.sampler:
+            logger.info(f"  Balanced epoch size: {train_loader.sampler.num_samples:,} samples "
+                       f"(original: {len(train_loader.dataset):,}, "
+                       f"ratio: {train_loader.sampler.num_samples / len(train_loader.dataset):.2f}x)")
     
     val_loader = get_dataloader(
         val_file,

@@ -76,15 +76,43 @@ horizontal_flip:
 
 **Note**: Only works if features contain B0 (x, y coordinates) as first 2 features.
 
-### 6. Face Orientation Aware
-Augmentation that detects and adapts to face orientation (left/right/center).
+### 6. Face Rotation
+2D rotation of face landmarks around face center.
 
-**Use case**: Handling different face orientations in dataset
+**Use case**: Handling head rotation, yaw variations
+
+**Config:**
+```yaml
+face_rotation:
+  p: 0.5              # Probability of applying
+  max_angle_deg: 15.0  # Maximum rotation angle in degrees (±15°)
+```
+
+**Note**: Automatically rotates velocities (B1 features) correctly.
+
+### 7. Face Translation
+Small random translation of face landmarks.
+
+**Use case**: Handling slight head movement, camera shift
+
+**Config:**
+```yaml
+face_translation:
+  p: 0.5              # Probability of applying
+  max_translation: 0.02  # Maximum translation in normalized coordinates (0-1 range)
+```
+
+### 8. Face Orientation Aware (Enhanced)
+Augmentation that detects and adapts to face orientation (left/right/center).
+Now includes proper rotation correction.
+
+**Use case**: Handling different face orientations in dataset, normalizing orientation
 
 **Config:**
 ```yaml
 face_orientation:
   p: 0.5              # Probability of applying
+  max_rotation_deg: 10.0  # Maximum rotation angle for orientation correction
 ```
 
 ## Configuration Example
@@ -129,11 +157,20 @@ augmentation:
       p: 0.3
       scale_range: [0.95, 1.05]
     
-    # horizontal_flip:
-    #   p: 0.5
+    horizontal_flip:
+      p: 0.5
     
-    # face_orientation:
-    #   p: 0.3
+    face_rotation:
+      p: 0.3
+      max_angle_deg: 15.0
+    
+    face_translation:
+      p: 0.3
+      max_translation: 0.02
+    
+    face_orientation:
+      p: 0.3
+      max_rotation_deg: 10.0
 ```
 
 ## Memory Considerations
