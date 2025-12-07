@@ -15,7 +15,8 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from functools import partial
 import os
 import sys
 
@@ -148,19 +149,20 @@ class FaceMeshExtractor:
                         # Get first face
                         face_landmarks = results.multi_face_landmarks[0]
                         
-                        # Extract coordinates for partition nodes
-                        coords = np.zeros((self.n_nodes, 2), dtype=np.float32)
+                        # Extract coordinates for partition nodes (X, Y, Z)
+                        coords = np.zeros((self.n_nodes, 3), dtype=np.float32)
                         
                         for new_idx, orig_idx in enumerate(self.nodes):
                             landmark = face_landmarks.landmark[orig_idx]
                             # Normalize by resolution: convert to [0, 1] range
                             coords[new_idx, 0] = landmark.x
                             coords[new_idx, 1] = landmark.y
+                            coords[new_idx, 2] = landmark.z  # Z coordinate (depth)
                         
                         landmarks_list.append(coords)
                     else:
                         # No face detected - use zeros
-                        coords = np.zeros((self.n_nodes, 2), dtype=np.float32)
+                        coords = np.zeros((self.n_nodes, 3), dtype=np.float32)
                         landmarks_list.append(coords)
                     
                     sample_frame_idx += 1
@@ -201,7 +203,7 @@ class FaceMeshExtractor:
             return {
                 'video_path': str(video_path),
                 'word': word,
-                'landmarks': landmarks_tensor,  # Shape: (frames, n_nodes, 2)
+                'landmarks': landmarks_tensor,  # Shape: (frames, n_nodes, 3) - X, Y, Z coordinates
                 'speech_mask': meta['speech_mask'],  # Shape: (frames,)
                 'meta': {
                     'vid_id': meta.get('vid_id', 0),
@@ -263,13 +265,9 @@ class FaceMeshExtractor:
         results = []
         failed_count = 0
         
-        # Use sequential processing for 'full' partition or when max_workers=1
-        # to avoid ProcessPoolExecutor crashes with MediaPipe GPU conflicts
-        if self.partition == 'full' or self.max_workers == 1:
+        # Use sequential processing when max_workers=1
             if self.max_workers == 1:
                 self.logger.info("Using sequential processing (max_workers=1)")
-            else:
-                self.logger.info("Using sequential processing for 'full' partition (468 nodes)")
             for video_path in tqdm(video_files, desc=f"Extracting {split}"):
                 meta_path = video_path.with_suffix('.txt')
                 if meta_path.exists():
@@ -282,8 +280,10 @@ class FaceMeshExtractor:
                     self.logger.warning(f"Missing meta file: {meta_path}")
                     failed_count += 1
         else:
-            # Use parallel processing for lips/mouth partitions
-            with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            # Use ThreadPoolExecutor - MediaPipe works fine with threads (no pickling issues)
+            # Threads share memory, so MediaPipe objects can be used directly
+            self.logger.info(f"Using ThreadPoolExecutor with {self.max_workers} workers")
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 # Submit all tasks
                 futures = {}
                 for video_path in video_files:

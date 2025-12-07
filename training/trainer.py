@@ -13,6 +13,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
+from .weight_decay_scheduler import WeightDecayScheduler
 
 
 class Trainer:
@@ -26,6 +27,7 @@ class Trainer:
         criterion: nn.Module,
         optimizer: optim.Optimizer,
         scheduler: Optional[optim.lr_scheduler._LRScheduler] = None,
+        weight_decay_scheduler: Optional[WeightDecayScheduler] = None,
         device: str = 'cuda',
         logger = None,
         epoch_callback: Optional[callable] = None
@@ -49,6 +51,7 @@ class Trainer:
         self.criterion = criterion
         self.optimizer = optimizer
         self.scheduler = scheduler
+        self.weight_decay_scheduler = weight_decay_scheduler
         self.device = device
         self.logger = logger
         self.epoch_callback = epoch_callback
@@ -68,7 +71,8 @@ class Trainer:
             'val_loss': [],
             'val_acc': [],
             'epoch_times': [],
-            'lr': []
+            'lr': [],
+            'weight_decay': []
         }
     
     def train_epoch(self, gradient_clip: Optional[float] = None, log_gradients: bool = False) -> Tuple[float, float]:
@@ -242,13 +246,27 @@ class Trainer:
             # Validate
             val_loss, val_acc = self.validate()
             
-            # Update scheduler
+            # Update learning rate scheduler
             if self.scheduler:
                 # ReduceLROnPlateau needs val_loss, others just step
                 if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
                     self.scheduler.step(val_loss)
                 else:
                     self.scheduler.step()
+            
+            # Update weight decay scheduler
+            if self.weight_decay_scheduler:
+                metrics = {
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'train_acc': train_acc,
+                    'val_acc': val_acc
+                }
+                self.weight_decay_scheduler.step(epoch=epoch, metrics=metrics)
+                current_wd = self.weight_decay_scheduler.get_last_weight_decay()
+                if self.logger and epoch % 5 == 0:  # Log every 5 epochs to avoid spam
+                    gap = train_acc - val_acc if train_acc and val_acc else 0.0
+                    self.logger.info(f"  Weight Decay: {current_wd:.8f}, Train-Val Gap: {gap:.4f}")
             
             # Record history
             epoch_time = time.time() - epoch_start_time
@@ -258,6 +276,8 @@ class Trainer:
             self.history['val_acc'].append(val_acc)
             self.history['epoch_times'].append(epoch_time)
             self.history['lr'].append(self.optimizer.param_groups[0]['lr'])
+            current_wd = self.optimizer.param_groups[0].get('weight_decay', 0.0)
+            self.history['weight_decay'].append(current_wd)
             
             # Log
             if self.logger:

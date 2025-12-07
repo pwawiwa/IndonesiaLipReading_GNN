@@ -17,6 +17,7 @@ from utils.model_loader import filter_model_config
 from models import get_model
 from training import get_dataloader, Trainer
 from training.augmentations import create_augmentation_pipeline
+from training.weight_decay_scheduler import create_weight_decay_scheduler
 
 
 def main():
@@ -152,10 +153,20 @@ def main():
     logger.info(f"Val samples: {len(val_loader.dataset)}")
     logger.info(f"Test samples: {len(test_loader.dataset)}")
     
-    # Class weights and focal loss are disabled per user request
-    use_class_weights = False
-    use_focal_loss = False
+    # Class weights - moderate weighting for imbalanced classes
+    use_class_weights = config['training'].get('use_class_weights', False)
+    class_weight_method = config['training'].get('class_weight_method', 'moderate')  # 'moderate', 'balanced', 'sqrt', 'inverse', 'log'
     class_weights = None
+    
+    if use_class_weights:
+        from utils.class_weights import calculate_class_weights
+        logger.info(f"Calculating class weights (method: {class_weight_method})...")
+        class_weights = calculate_class_weights(train_loader.dataset, method=class_weight_method)
+        class_weights = class_weights.to(args.device)
+        logger.info(f"Class weights computed: min={class_weights.min():.4f}, max={class_weights.max():.4f}, mean={class_weights.mean():.4f}")
+        logger.info(f"  (Higher weights = rarer classes get more attention)")
+    else:
+        logger.info("Class weights disabled")
     
     # Build model
     logger.info("Building model...")
@@ -175,15 +186,23 @@ def main():
     logger.info(f"Model: {model_name}")
     logger.info(f"Parameters: {model.count_parameters():,}")
     
-    # Loss function - standard CrossEntropyLoss (no class weights or focal loss)
+    # Loss function - CrossEntropyLoss with optional class weights
     label_smoothing = config['training'].get('label_smoothing', 0.0)
     
-    if label_smoothing > 0:
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        logger.info(f"Using label smoothing: {label_smoothing}")
+    if use_class_weights and class_weights is not None:
+        if label_smoothing > 0:
+            criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+            logger.info(f"Using CrossEntropyLoss with class weights (method: {class_weight_method}) and label smoothing: {label_smoothing}")
+        else:
+            criterion = nn.CrossEntropyLoss(weight=class_weights)
+            logger.info(f"Using CrossEntropyLoss with class weights (method: {class_weight_method})")
     else:
-        criterion = nn.CrossEntropyLoss()
-        logger.info("Using standard CrossEntropyLoss")
+        if label_smoothing > 0:
+            criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+            logger.info(f"Using CrossEntropyLoss with label smoothing: {label_smoothing}")
+        else:
+            criterion = nn.CrossEntropyLoss()
+            logger.info("Using standard CrossEntropyLoss")
     
     # Optimizer
     optimizer_name = config['training']['optimizer'].lower()
@@ -262,6 +281,56 @@ def main():
             scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             logger.info(f"Scheduler: Warmup ({warmup_epochs} epochs) + CosineAnnealingLR (T_max={T_max}, eta_min={eta_min})")
     
+    # Weight Decay Scheduler (optional - adaptive weight decay)
+    weight_decay_scheduler = None
+    if 'weight_decay_scheduler' in config['training']:
+        wd_scheduler_config = config['training']['weight_decay_scheduler']
+        scheduler_type = wd_scheduler_config.get('type', 'cosine').lower()
+        
+        # Get initial weight decay (use current optimizer's weight_decay)
+        initial_wd = weight_decay
+        
+        # Create weight decay scheduler
+        wd_scheduler_kwargs = wd_scheduler_config.copy()
+        wd_scheduler_kwargs.pop('type', None)  # Remove 'type' from kwargs
+        
+        # Set defaults based on scheduler type
+        if scheduler_type == 'cosine' or scheduler_type == 'cosineannealing':
+            if 'T_max' not in wd_scheduler_kwargs:
+                wd_scheduler_kwargs['T_max'] = config['training']['epochs']
+            if 'min_wd' not in wd_scheduler_kwargs:
+                wd_scheduler_kwargs['min_wd'] = 0.0
+        elif scheduler_type == 'adaptive_gap' or scheduler_type == 'adaptive':
+            if 'min_wd' not in wd_scheduler_kwargs:
+                wd_scheduler_kwargs['min_wd'] = 1e-6
+            if 'max_wd' not in wd_scheduler_kwargs:
+                wd_scheduler_kwargs['max_wd'] = 0.01
+        
+        weight_decay_scheduler = create_weight_decay_scheduler(
+            scheduler_type=scheduler_type,
+            optimizer=optimizer,
+            initial_wd=initial_wd,
+            **wd_scheduler_kwargs
+        )
+        
+        logger.info(f"Weight Decay Scheduler: {scheduler_type} (initial_wd={initial_wd:.8f})")
+        if scheduler_type == 'cosine':
+            min_wd_val = float(wd_scheduler_kwargs.get('min_wd', 0.0))
+            logger.info(f"  T_max={wd_scheduler_kwargs.get('T_max', 'N/A')}, min_wd={min_wd_val:.8f}")
+        elif scheduler_type == 'linear_warmup':
+            start_wd_val = float(wd_scheduler_kwargs.get('start_wd', initial_wd*0.01))
+            target_wd_val = float(wd_scheduler_kwargs.get('target_wd', initial_wd))
+            logger.info(f"  start_wd={start_wd_val:.8f}, "
+                       f"target_wd={target_wd_val:.8f}, "
+                       f"warmup_epochs={wd_scheduler_kwargs.get('warmup_epochs', 10)}")
+        elif scheduler_type == 'adaptive_gap' or scheduler_type == 'adaptive':
+            min_wd_val = float(wd_scheduler_kwargs.get('min_wd', 1e-6))
+            max_wd_val = float(wd_scheduler_kwargs.get('max_wd', 0.01))
+            gap_threshold_val = float(wd_scheduler_kwargs.get('gap_threshold', 0.05))
+            logger.info(f"  min_wd={min_wd_val:.8f}, "
+                       f"max_wd={max_wd_val:.8f}, "
+                       f"gap_threshold={gap_threshold_val:.4f}")
+    
     # Define callback to save metadata after each epoch
     def save_metadata_callback(epoch, save_dir, metrics):
         """Save run metadata and summary after each epoch."""
@@ -317,6 +386,7 @@ def main():
         criterion=criterion,
         optimizer=optimizer,
         scheduler=scheduler,
+        weight_decay_scheduler=weight_decay_scheduler,
         device=args.device,
         logger=logger,
         epoch_callback=save_metadata_callback
@@ -390,6 +460,14 @@ def main():
         f.write(f"Parameters: {model.count_parameters():,}\n")
         f.write(f"\n")
         f.write(f"Best Val Accuracy: {trainer.best_val_acc:.2f}% (epoch {trainer.best_epoch})\n")
+        f.write(f"Test Accuracy: {test_acc:.2f}%\n")
+        f.write(f"Test Loss: {test_loss:.4f}\n")
+        f.write(f"\n")
+        f.write("=" * 60 + "\n")
+        f.write("BEST MODEL PERFORMANCE\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Best Model: Saved at epoch {trainer.best_epoch}\n")
+        f.write(f"Validation Accuracy: {trainer.best_val_acc:.2f}%\n")
         f.write(f"Test Accuracy: {test_acc:.2f}%\n")
         f.write(f"Test Loss: {test_loss:.4f}\n")
         f.write("=" * 60 + "\n")

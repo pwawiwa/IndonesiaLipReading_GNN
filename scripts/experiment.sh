@@ -23,13 +23,13 @@ SEED=0
 FPS=25
 
 # Target feature levels - will run for each level
-# CUMULATIVE FEATURE COUNTS (each file contains all previous levels):
-#   B0: 2 features (x, y)
-#   B1: 7 features (B0: 2 + B1: 5 = vx, vy, speed, ax, ay)
-#   B2: 15 features (B0: 2 + B1: 5 + B2: 8 = MAR, lip_width, lip_height, jaw_height, cheek_puff, lip_curvature, lip_corner_angle, jaw_opening) - computed directly from extracted data
-#   B3: 11 features (B0: 2 + B1: 3 + B2: 2 + B3: 4 = AU features)
+# CUMULATIVE FEATURE COUNTS (each file contains all previous levels, 3D coordinates):
+#   B0: 3 features (X, Y, Z - 3D normalized coordinates)
+#   B1: 10 features (B0: 3 + B1: 7 = vx, vy, vz, speed, ax, ay, az - all 3D)
+#   B2: 18 features (B0: 3 + B1: 7 + B2: 8 = MAR, lip_width, lip_height, jaw_height, cheek_puff, lip_curvature, lip_corner_angle, jaw_opening) - computed directly from extracted data using 3D Euclidean distances
+#   B3: 22 features (B0: 3 + B1: 7 + B2: 8 + B3: 4 = AU25, AU26, AU12, AU27 - using 3D displacement magnitudes)
 # Best model used B2 (geometric features), so we'll try both B1 and B2
-TARGET_FEATURE_LEVELS=("B2")  # Run for B1 and B2 feature levels (B2 was best for full partition)
+TARGET_FEATURE_LEVELS=("B1" "B0")  # Run for B1 and B2 feature levels (B2 was best for full partition)
 
 # Models for mouth partition with B1 features:
 # - All LSTM models: gin_lstm, gnn_lstm, graphsage_lstm, adaptive_gcn_lstm
@@ -39,25 +39,65 @@ MODELS=("gin_lstm_mamba" "gnn_lstm_mamba" "graphsage_lstm_mamba" "adaptive_gcn_l
 
 # Training hyperparameters
 # BEST CONFIG: Optimal hyperparameters for best performance
-BATCH_SIZE=32  # Best config: optimal batch size
+BATCH_SIZE=${BATCH_SIZE:-32}  # Matches best_config_34,2.yaml (default: 32)
 HIDDEN_DIM=256  # Best config: optimal hidden dimension
-NUM_EPOCHS=${EPOCHS:-150}  # 150 epochs (no early stopping)
+NUM_EPOCHS=${EPOCHS:-100}  # 150 epochs (no early stopping) - matches best_config_34,2.yaml
 NUM_WORKERS=0  # Set to 0 to avoid memory duplication across workers
-LEARNING_RATE=0.0001  # Best config: matches best model (gin_lstm_mamba used 0.0001)
-WEIGHT_DECAY=0.0001   # Best config: matches best model (gin_lstm_mamba used 0.0001)
+LEARNING_RATE=${LEARNING_RATE:-0.0001}  # Matches best_config_34,2.yaml (was: 0.00005)
+WEIGHT_DECAY=${WEIGHT_DECAY:-0.0001}   # Matches best_config_34,2.yaml (fixed, no adaptive scheduler)
 GRADIENT_CLIP=1.0  # Gradient clipping to prevent exploding gradients
 
-# Speech mask scaling factor - test multiple values to find optimal
-# Controls how much speech_mask influences attention (higher = more influence)
-# Values to test: 0.5, 1.0, 2.0, 5.0, 10.0 (default: 5.0)
-# Set via env var: SPEECH_MASK_SCALE=10.0 ./scripts/experiment.sh
-SPEECH_MASK_SCALE=${SPEECH_MASK_SCALE:-10.0}  # Default: 5.0 (can override via env var)
+# Weight Decay Strategy - DISABLED by default (use fixed weight_decay from best_config_34,2.yaml)
+# Set WEIGHT_DECAY_SCHEDULER_TYPE to enable adaptive weight decay if needed
+# Examples:
+#   ./scripts/experiment.sh  # Uses fixed weight_decay=0.0001 (matches best_config_34,2.yaml)
+#   WEIGHT_DECAY_SCHEDULER_TYPE=adaptive_gap ./scripts/experiment.sh  # Enable adaptive scheduler
+WEIGHT_DECAY_SCHEDULER_TYPE=${WEIGHT_DECAY_SCHEDULER_TYPE:-}  # Default: disabled (empty = fixed weight_decay), options: adaptive_gap, linear_warmup, cosine, step, plateau, exponential
+WEIGHT_DECAY_SCHEDULER_MIN_WD=${WEIGHT_DECAY_SCHEDULER_MIN_WD:-0.0005}  # For adaptive_gap: minimum WD (increased from 1e-6 to 0.0005 to start with stronger regularization)
+WEIGHT_DECAY_SCHEDULER_MAX_WD=${WEIGHT_DECAY_SCHEDULER_MAX_WD:-0.01}  # For adaptive_gap: maximum WD
+WEIGHT_DECAY_SCHEDULER_GAP_THRESHOLD=${WEIGHT_DECAY_SCHEDULER_GAP_THRESHOLD:-0.02}  # For adaptive_gap: gap threshold (reduced from 0.05 to 0.02 = 2% accuracy gap to detect overfitting earlier)
+WEIGHT_DECAY_SCHEDULER_FAST_DROP_THRESHOLD=${WEIGHT_DECAY_SCHEDULER_FAST_DROP_THRESHOLD:-0.15}  # For adaptive_gap: fast drop threshold (increased from 0.1 to 0.15 = 15% per epoch to be less sensitive)
+WEIGHT_DECAY_SCHEDULER_INCREASE_FACTOR=${WEIGHT_DECAY_SCHEDULER_INCREASE_FACTOR:-1.5}  # For adaptive_gap: multiply by this when gap increases (increased from 1.2 to 1.5 for more aggressive regularization)
+WEIGHT_DECAY_SCHEDULER_DECREASE_FACTOR=${WEIGHT_DECAY_SCHEDULER_DECREASE_FACTOR:-0.95}  # For adaptive_gap: multiply by this when training drops too fast (reduced from 0.9 to 0.95 to decrease less aggressively)
+WEIGHT_DECAY_SCHEDULER_LOOKBACK_WINDOW=${WEIGHT_DECAY_SCHEDULER_LOOKBACK_WINDOW:-3}  # For adaptive_gap: epochs to look back (reduced from 5 to 3 for faster response)
+# Legacy linear_warmup parameters (used if type=linear_warmup)
+WEIGHT_DECAY_SCHEDULER_START_WD=${WEIGHT_DECAY_SCHEDULER_START_WD:-0.00001}  # For linear_warmup: start at 1e-5
+WEIGHT_DECAY_SCHEDULER_TARGET_WD=${WEIGHT_DECAY_SCHEDULER_TARGET_WD:-0.0001}  # For linear_warmup: target 1e-4
+WEIGHT_DECAY_SCHEDULER_WARMUP_EPOCHS=${WEIGHT_DECAY_SCHEDULER_WARMUP_EPOCHS:-10}  # For linear_warmup: warmup epochs
+WEIGHT_DECAY_SCHEDULER_T_MAX=${WEIGHT_DECAY_SCHEDULER_T_MAX:-${NUM_EPOCHS}}  # For cosine (defaults to NUM_EPOCHS)
+WEIGHT_DECAY_SCHEDULER_MIN_WD=${WEIGHT_DECAY_SCHEDULER_MIN_WD:-0.0}  # For cosine, step, exponential
+WEIGHT_DECAY_SCHEDULER_STEP_SIZE=${WEIGHT_DECAY_SCHEDULER_STEP_SIZE:-10}  # For step
+WEIGHT_DECAY_SCHEDULER_GAMMA=${WEIGHT_DECAY_SCHEDULER_GAMMA:-0.1}  # For step, exponential
+WEIGHT_DECAY_SCHEDULER_PATIENCE=${WEIGHT_DECAY_SCHEDULER_PATIENCE:-5}  # For plateau
+WEIGHT_DECAY_SCHEDULER_FACTOR=${WEIGHT_DECAY_SCHEDULER_FACTOR:-5}  # For plateau
 
-# Speech mask context - number of adjacent frames to include around speech_mask=1
-# If > 0, applies weight to +/- N frames around speech regions
-# Helps account for co-articulation and imperfect mask accuracy
-# Recommended: 1-3 frames (at 25 FPS: 1 frame = 40ms, 2 frames = 80ms, 3 frames = 120ms)
-SPEECH_MASK_CONTEXT=${SPEECH_MASK_CONTEXT:-1}  # Default: 1 frame (can override via env var)
+# Optimizer selection - matches best_config_34,2.yaml
+OPTIMIZER=${OPTIMIZER:-adam}  # Options: adam, adamw, sgd (default: adam - matches best_config_34,2.yaml)
+
+# Class weights for handling imbalanced classes - DISABLED by default (causes overfitting)
+# Class weights were found to cause severe overfitting (train: 60% vs val: 15.6%)
+# Use label smoothing instead for better generalization
+USE_CLASS_WEIGHTS=${USE_CLASS_WEIGHTS:-false}  # Disabled by default (was causing overfitting)
+CLASS_WEIGHT_METHOD=${CLASS_WEIGHT_METHOD:-moderate}  # moderate, balanced, sqrt, inverse, log (not used if disabled)
+
+# Label smoothing - matches best_config_34,2.yaml
+LABEL_SMOOTHING=${LABEL_SMOOTHING:-0.0}  # Best config: 0.0 (no label smoothing)
+
+# Dropout - matches best_config_34,2.yaml
+DROPOUT=${DROPOUT:-0.5}  # Best config: 0.5 (matches best_config_34,2.yaml)
+
+# Early stopping - matches best_config_34,2.yaml (disabled)
+EARLY_STOPPING_PATIENCE=${EARLY_STOPPING_PATIENCE:-999999}  # Best config: disabled (999999 = no early stopping)
+
+# Speech mask scaling factor - matches best_config_34,2.yaml
+# Controls how much speech_mask influences attention (higher = more influence)
+# Best config: 10.0
+SPEECH_MASK_SCALE=${SPEECH_MASK_SCALE:-10.0}  # Best config: 10.0 (matches best_config_34,2.yaml)
+
+# Speech mask context - matches best_config_34,2.yaml
+# Number of adjacent frames to include around speech_mask=1
+# Best config: 1 frame
+SPEECH_MASK_CONTEXT=${SPEECH_MASK_CONTEXT:-1}  # Best config: 1 (matches best_config_34,2.yaml)
 
 # Model-specific batch sizes (all models use batch size 8 for full partition)
 declare -A MODEL_BATCH_SIZES
@@ -267,7 +307,8 @@ compute_features() {
     python3 << EOF
 import sys
 import os
-# Disable multiprocessing - force sequential processing
+# Allow threading for parallel feature computation (ThreadPoolExecutor uses threads)
+# Keep BLAS single-threaded to avoid conflicts with threading
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
@@ -343,10 +384,44 @@ EOF
     
     if [ $compute_exit_code -eq 0 ]; then
         log "  ✓ Features ${feature_set} computed"
+        
+        # Generate feature samples for verification
+        log "  Generating feature samples for ${feature_set}..."
+        generate_feature_samples "${feature_set}"
+        
         return 0
     else
         log "  ✗ Features ${feature_set} failed"
         return 1
+    fi
+}
+
+generate_feature_samples() {
+    local feature_set=$1
+    
+    # Only generate samples for train split (to save time)
+    local extracted_file="${EXTRACTED_DIR}/${PARTITION}/${PARTITION}_train.pt"
+    local samples_dir="${FEATURES_DIR}/B0_B1_B2_B3_samples/${PARTITION}"
+    
+    # Check if samples already exist
+    if [ -d "${samples_dir}" ] && [ "$(ls -A ${samples_dir} 2>/dev/null)" ]; then
+        log "    Feature samples already exist, skipping..."
+        return 0
+    fi
+    
+    # Generate samples using the Python script
+    log "    Running feature sample generation..."
+    python3 scripts/generate_feature_samples.py \
+        --extracted-file "${extracted_file}" \
+        --partition "${PARTITION}" \
+        --output-dir "${FEATURES_DIR}" \
+        --num-samples 3 \
+        >> "${LOGS_DIR}/feature_samples_${feature_set}.log" 2>&1
+    
+    if [ $? -eq 0 ]; then
+        log "    ✓ Feature samples generated"
+    else
+        log "    ⚠ Feature sample generation failed (non-critical)"
     fi
 }
 
@@ -371,6 +446,15 @@ train_model() {
     
     # Create temporary config file
     local config_file="${result_dir}/config.yaml"
+    
+    # Use best_config_34_val_acc.yaml as base template
+    local best_config="${RESULTS_DIR}/configs/best_config_34_val_acc.yaml"
+    if [ ! -f "${best_config}" ]; then
+        log "  ⚠ Warning: best_config_34_val_acc.yaml not found, using default config generation"
+        best_config=""
+    else
+        log "  Using best_config_34_val_acc.yaml as base template"
+    fi
     
     # Generate model-specific parameters
     local model_params=""
@@ -485,47 +569,47 @@ train_model() {
             if [ "${model_name}" = "gin_lstm_mamba" ]; then
                 model_params="    num_gin_layers: 2
     num_lstm_layers: 1
-    dropout: 0.5  # Best config: matches best model (gin_lstm_mamba used 0.5)
+    dropout: ${DROPOUT:-0.5}  # Best config: 0.5 (matches best_config_34,2.yaml)
     bidirectional: true
     eps: 0.0
     train_eps: false
     mamba_d_state: 16
     mamba_d_conv: 4
     mamba_expand: 2
-    speech_mask_scale: ${SPEECH_MASK_SCALE}  # Speech mask scaling factor (test: 0.5, 1.0, 2.0, 5.0, 10.0)
-    speech_mask_context: ${SPEECH_MASK_CONTEXT}  # Adjacent frames to include (0=exact, 1-3=context)"
+    speech_mask_scale: ${SPEECH_MASK_SCALE:-10.0}  # Best config: 10.0 (matches best_config_34,2.yaml)
+    speech_mask_context: ${SPEECH_MASK_CONTEXT:-1}  # Best config: 1 (matches best_config_34,2.yaml)"
             elif [ "${model_name}" = "gnn_lstm_mamba" ]; then
                 model_params="    num_gnn_layers: 2
     num_lstm_layers: 1
-    dropout: 0.5  # Best config: matches best model (same as gin_lstm_mamba)
+    dropout: ${DROPOUT:-0.5}  # Best config: 0.5 (matches best_config_34,2.yaml)
     bidirectional: true
     mamba_d_state: 16
     mamba_d_conv: 4
     mamba_expand: 2
-    speech_mask_scale: ${SPEECH_MASK_SCALE}  # Speech mask scaling factor (test: 0.5, 1.0, 2.0, 5.0, 10.0)
-    speech_mask_context: ${SPEECH_MASK_CONTEXT}  # Adjacent frames to include (0=exact, 1-3=context)"
+    speech_mask_scale: ${SPEECH_MASK_SCALE:-10.0}  # Best config: 10.0 (matches best_config_34,2.yaml)
+    speech_mask_context: ${SPEECH_MASK_CONTEXT:-1}  # Best config: 1 (matches best_config_34,2.yaml)"
             elif [ "${model_name}" = "graphsage_lstm_mamba" ]; then
                 model_params="    num_sage_layers: 2
     num_lstm_layers: 1
-    dropout: 0.5  # Best config: matches best model (same as gin_lstm_mamba)
+    dropout: ${DROPOUT:-0.5}  # Best config: 0.5 (matches best_config_34,2.yaml)
     bidirectional: true
     aggregator: mean
     mamba_d_state: 16
     mamba_d_conv: 4
     mamba_expand: 2
-    speech_mask_scale: ${SPEECH_MASK_SCALE}  # Speech mask scaling factor (test: 0.5, 1.0, 2.0, 5.0, 10.0)
-    speech_mask_context: ${SPEECH_MASK_CONTEXT}  # Adjacent frames to include (0=exact, 1-3=context)"
+    speech_mask_scale: ${SPEECH_MASK_SCALE:-10.0}  # Best config: 10.0 (matches best_config_34,2.yaml)
+    speech_mask_context: ${SPEECH_MASK_CONTEXT:-1}  # Best config: 1 (matches best_config_34,2.yaml)"
             elif [ "${model_name}" = "adaptive_gcn_lstm_mamba" ]; then
                 model_params="    num_gcn_layers: 2
     num_lstm_layers: 1
-    dropout: 0.5  # Best config: matches best model (same as gin_lstm_mamba)
+    dropout: ${DROPOUT:-0.5}  # Best config: 0.5 (matches best_config_34,2.yaml)
     bidirectional: true
     alpha: 0.5
     mamba_d_state: 16
     mamba_d_conv: 4
     mamba_expand: 2
-    speech_mask_scale: ${SPEECH_MASK_SCALE}  # Speech mask scaling factor (test: 0.5, 1.0, 2.0, 5.0, 10.0)
-    speech_mask_context: ${SPEECH_MASK_CONTEXT}  # Adjacent frames to include (0=exact, 1-3=context)"
+    speech_mask_scale: ${SPEECH_MASK_SCALE:-10.0}  # Best config: 10.0 (matches best_config_34,2.yaml)
+    speech_mask_context: ${SPEECH_MASK_CONTEXT:-1}  # Best config: 1 (matches best_config_34,2.yaml)"
             fi
             ;;
         *)
@@ -536,7 +620,159 @@ train_model() {
             ;;
     esac
     
-    cat > "${config_file}" << EOF
+    # Build weight decay scheduler config (if enabled)
+    weight_decay_scheduler_config=""
+    if [ -n "${WEIGHT_DECAY_SCHEDULER_TYPE}" ]; then
+        weight_decay_scheduler_config="  # Adaptive Weight Decay Scheduler
+  weight_decay_scheduler:
+    type: ${WEIGHT_DECAY_SCHEDULER_TYPE}"
+        case "${WEIGHT_DECAY_SCHEDULER_TYPE}" in
+            linear_warmup)
+                weight_decay_scheduler_config="${weight_decay_scheduler_config}
+    start_wd: ${WEIGHT_DECAY_SCHEDULER_START_WD}
+    target_wd: ${WEIGHT_DECAY_SCHEDULER_TARGET_WD}
+    warmup_epochs: ${WEIGHT_DECAY_SCHEDULER_WARMUP_EPOCHS}"
+                ;;
+            cosine)
+                weight_decay_scheduler_config="${weight_decay_scheduler_config}
+    T_max: ${WEIGHT_DECAY_SCHEDULER_T_MAX}
+    min_wd: ${WEIGHT_DECAY_SCHEDULER_MIN_WD}"
+                ;;
+            step)
+                weight_decay_scheduler_config="${weight_decay_scheduler_config}
+    step_size: ${WEIGHT_DECAY_SCHEDULER_STEP_SIZE}
+    gamma: ${WEIGHT_DECAY_SCHEDULER_GAMMA}
+    min_wd: ${WEIGHT_DECAY_SCHEDULER_MIN_WD}"
+                ;;
+            plateau)
+                weight_decay_scheduler_config="${weight_decay_scheduler_config}
+    mode: min
+    factor: ${WEIGHT_DECAY_SCHEDULER_FACTOR}
+    patience: ${WEIGHT_DECAY_SCHEDULER_PATIENCE}
+    min_wd: ${WEIGHT_DECAY_SCHEDULER_MIN_WD}"
+                ;;
+            exponential)
+                weight_decay_scheduler_config="${weight_decay_scheduler_config}
+    gamma: ${WEIGHT_DECAY_SCHEDULER_GAMMA}
+    min_wd: ${WEIGHT_DECAY_SCHEDULER_MIN_WD}"
+                ;;
+            adaptive_gap|adaptive)
+                weight_decay_scheduler_config="${weight_decay_scheduler_config}
+    min_wd: ${WEIGHT_DECAY_SCHEDULER_MIN_WD}
+    max_wd: ${WEIGHT_DECAY_SCHEDULER_MAX_WD}
+    gap_threshold: ${WEIGHT_DECAY_SCHEDULER_GAP_THRESHOLD}
+    fast_drop_threshold: ${WEIGHT_DECAY_SCHEDULER_FAST_DROP_THRESHOLD}
+    increase_factor: ${WEIGHT_DECAY_SCHEDULER_INCREASE_FACTOR}
+    decrease_factor: ${WEIGHT_DECAY_SCHEDULER_DECREASE_FACTOR}
+    lookback_window: ${WEIGHT_DECAY_SCHEDULER_LOOKBACK_WINDOW}"
+                ;;
+        esac
+    fi
+    
+    # Expand bash variables with defaults
+    local early_stopping_patience="${EARLY_STOPPING_PATIENCE:-999999}"
+    local label_smoothing="${LABEL_SMOOTHING:-0.0}"
+    local use_class_weights="${USE_CLASS_WEIGHTS:-false}"
+    local class_weight_method="${CLASS_WEIGHT_METHOD:-moderate}"
+    
+    # Generate config file using best_config_34_val_acc.yaml as base
+    if [ -n "${best_config}" ]; then
+        # Use Python to load best config and update necessary fields
+        python3 << PYTHON_SCRIPT
+import yaml
+import sys
+import os
+from pathlib import Path
+import io
+
+# Helper function to convert string booleans to Python booleans
+def str_to_bool(s):
+    if isinstance(s, bool):
+        return s
+    return s.lower() in ('true', '1', 'yes', 'on')
+
+# Get variables from environment (set by bash)
+best_config_path = "${best_config}"
+config_file_path = "${config_file}"
+partition = "${PARTITION}"
+feature_set = "${feature_set}"
+features_dir = "${FEATURES_DIR}"
+model_name = "${model_name}"
+hidden_dim = ${HIDDEN_DIM}
+batch_size = ${batch_size}
+num_epochs = ${NUM_EPOCHS}
+learning_rate = ${LEARNING_RATE}
+weight_decay = ${WEIGHT_DECAY}
+optimizer = "${OPTIMIZER}"
+early_stopping_patience = ${early_stopping_patience}
+gradient_clip = ${GRADIENT_CLIP}
+label_smoothing = ${label_smoothing}
+num_workers = ${NUM_WORKERS}
+use_class_weights = str_to_bool("${use_class_weights}")
+class_weight_method = "${class_weight_method}"
+model_params_yaml = """${model_params}"""
+weight_decay_scheduler_yaml = """${weight_decay_scheduler_config}"""
+
+# Load best config
+with open(best_config_path, 'r') as f:
+    config = yaml.safe_load(f)
+
+# Update data section
+config['data']['partition'] = partition
+config['data']['feature_level'] = feature_set
+config['data']['feature_dir'] = features_dir
+
+# Update model section
+config['model']['name'] = model_name
+config['model']['params']['hidden_dim'] = hidden_dim
+
+# Parse and update model-specific params
+if model_params_yaml.strip():
+    model_params_dict = yaml.safe_load(io.StringIO(model_params_yaml))
+    if model_params_dict:
+        config['model']['params'].update(model_params_dict)
+
+# Update training section
+config['training']['output_dir'] = "${RESULTS_DIR}"
+config['training']['batch_size'] = batch_size
+config['training']['epochs'] = num_epochs
+config['training']['learning_rate'] = learning_rate
+config['training']['weight_decay'] = weight_decay
+config['training']['optimizer'] = optimizer
+if 'scheduler' not in config['training']:
+    config['training']['scheduler'] = {}
+config['training']['scheduler']['name'] = "reduceonplateau"
+config['training']['scheduler']['mode'] = "min"
+config['training']['scheduler']['factor'] = 0.7
+config['training']['scheduler']['patience'] = 25
+config['training']['scheduler']['min_lr'] = 1e-6
+config['training']['early_stopping_patience'] = early_stopping_patience
+config['training']['gradient_clip'] = gradient_clip
+config['training']['label_smoothing'] = label_smoothing
+config['training']['num_workers'] = num_workers
+config['training']['balance_classes'] = False
+config['training']['balance_factor'] = 1.0
+config['training']['use_class_weights'] = use_class_weights
+config['training']['class_weight_method'] = class_weight_method
+
+# Update augmentation (disabled)
+if 'augmentation' not in config:
+    config['augmentation'] = {}
+config['augmentation']['enabled'] = False
+
+# Add weight decay scheduler if configured
+if weight_decay_scheduler_yaml.strip():
+    wd_scheduler_dict = yaml.safe_load(io.StringIO(weight_decay_scheduler_yaml))
+    if wd_scheduler_dict:
+        config['training'].update(wd_scheduler_dict)
+
+# Save config
+with open(config_file_path, 'w') as f:
+    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+PYTHON_SCRIPT
+    else
+        # Fallback: generate config from scratch (original method)
+        cat > "${config_file}" << EOF
 data:
   partition: ${PARTITION}
   feature_level: ${feature_set}
@@ -554,24 +790,27 @@ training:
   epochs: ${NUM_EPOCHS}
   learning_rate: ${LEARNING_RATE}
   weight_decay: ${WEIGHT_DECAY}
-  optimizer: adam
+  optimizer: ${OPTIMIZER}
   scheduler:
-    name: reduceonplateau  # Best config: matches best model (gin_lstm_mamba used reduceonplateau)
+    name: reduceonplateau
     mode: min
     factor: 0.7
     patience: 25
     min_lr: 1e-6
-  early_stopping_patience: 999999  # Disabled: set to very large value (no early stopping)
+${weight_decay_scheduler_config}
+  early_stopping_patience: ${EARLY_STOPPING_PATIENCE:-999999}
   gradient_clip: ${GRADIENT_CLIP}
-  label_smoothing: 0.0  # Best config: matches best model (gin_lstm_mamba used 0.0)
+  label_smoothing: ${LABEL_SMOOTHING:-0.0}
   num_workers: ${NUM_WORKERS}
-  balance_classes: false  # Disable class balancing (best config didn't use it)
-  balance_factor: 1.0  # Not used when balance_classes=false
+  balance_classes: false
+  balance_factor: 1.0
+  use_class_weights: ${USE_CLASS_WEIGHTS:-false}
+  class_weight_method: ${CLASS_WEIGHT_METHOD:-moderate}
 
-# Augmentation configuration - DISABLED (best config didn't use augmentation)
 augmentation:
-  enabled: false  # Best config: no augmentation
+  enabled: false
 EOF
+    fi
     
     # Run training
     # Note: loss_history.png will be automatically generated after each epoch during training
@@ -586,6 +825,18 @@ EOF
         # Verify model was actually saved
         if [ -f "${result_dir}/best.pth" ]; then
             log "  ✓ Training ${model_name}/${feature_set} complete"
+            
+            # Generate classification report and confusion matrix
+            log "  Generating classification report..."
+            python3 evaluate_best_model.py \
+                --result-dir "${result_dir}" \
+                --device cuda \
+                >> "${result_dir}/train.log" 2>&1
+            if [ $? -eq 0 ]; then
+                log "  ✓ Classification report generated"
+            else
+                log "  ⚠ Classification report generation failed (non-critical)"
+            fi
             
             # Generate final training visualizations (loss_history.png is already generated each epoch)
             if [ -f "${result_dir}/history.pt" ]; then
@@ -639,7 +890,7 @@ log "Total scenarios: $((${#MODELS[@]} * ${#TARGET_FEATURE_LEVELS[@]}))"
 log "Model capacity: HIDDEN_DIM=${HIDDEN_DIM} (doubled from best config), BATCH_SIZE=${BATCH_SIZE}, increased layers (3 GIN/GCN, 2 LSTM/GRU)"
 log "Processing: Will preprocess prerequisites for each level if needed"
 log "Training: Each B level file contains cumulative features (no concatenation needed)"
-log "Cumulative feature counts: B0=2, B1=7 (B0+B1), B2=15 (B0+B1+B2), B3=19 (B0+B1+B2+B3)"
+log "Cumulative feature counts (3D): B0=3, B1=10 (B0+B1), B2=18 (B0+B1+B2), B3=22 (B0+B1+B2+B3)"
 log "Memory optimization: Acceleration removed from B1, 1 anchor+no ratio in B2, PCA/motion removed from B3"
 log "="*80
 
@@ -675,6 +926,11 @@ for TARGET_FEATURE_LEVEL in "${TARGET_FEATURE_LEVELS[@]}"; do
         continue
     fi
     
+    # Generate feature samples after prerequisites are ready (if not already generated)
+    log ""
+    log "Generating feature samples for verification..."
+    generate_feature_samples "${TARGET_FEATURE_LEVEL}"
+    
     # Process each model with the target feature level
     # Each B level file contains cumulative features (B1 has B0+B1, B2 has B0+B1+B2, etc.)
     for model_name in "${MODELS[@]}"; do
@@ -686,7 +942,23 @@ for TARGET_FEATURE_LEVEL in "${TARGET_FEATURE_LEVELS[@]}"; do
         # Check if already trained
         result_dir="${RESULTS_DIR}/${PARTITION}/${TARGET_FEATURE_LEVEL}/${model_name}/seed_${SEED}"
         if [ -f "${result_dir}/best.pth" ]; then
-            log "  Scenario ${model_name}/${TARGET_FEATURE_LEVEL} already trained, skipping..."
+            log "  Scenario ${model_name}/${TARGET_FEATURE_LEVEL} already trained"
+            
+            # Check if classification report exists, if not generate it
+            if [ ! -f "${result_dir}/classification_report.txt" ] || [ ! -f "${result_dir}/confusion_matrix.png" ]; then
+                log "  Generating classification report for existing model..."
+                python3 evaluate_best_model.py \
+                    --result-dir "${result_dir}" \
+                    --device cuda \
+                    >> "${result_dir}/train.log" 2>&1
+                if [ $? -eq 0 ]; then
+                    log "  ✓ Classification report generated"
+                else
+                    log "  ⚠ Classification report generation failed (non-critical)"
+                fi
+            else
+                log "  ✓ Classification report already exists, skipping..."
+            fi
             continue
         fi
         
@@ -694,12 +966,12 @@ for TARGET_FEATURE_LEVEL in "${TARGET_FEATURE_LEVELS[@]}"; do
         log "  Training ${model_name} with ${TARGET_FEATURE_LEVEL}..."
         log "  Note: ${TARGET_FEATURE_LEVEL} file contains cumulative features (all previous levels included)"
         
-        # Calculate total features for this level (cumulative)
+        # Calculate total features for this level (cumulative, 3D coordinates)
         case "${TARGET_FEATURE_LEVEL}" in
-            "B0") total_features=2 ;;
-            "B1") total_features=7 ;;  # B0(2) + B1(5) = vx, vy, speed, ax, ay
-            "B2") total_features=15 ;;  # B0(2) + B1(5) + B2(8) - computed directly from extracted data
-            "B3") total_features=11 ;; # B0(2) + B1(3) + B2(2) + B3(4)
+            "B0") total_features=3 ;;  # X, Y, Z - 3D normalized coordinates
+            "B1") total_features=10 ;;  # B0(3) + B1(7) = vx, vy, vz, speed, ax, ay, az - all 3D
+            "B2") total_features=18 ;;  # B0(3) + B1(7) + B2(8) - computed directly from extracted data using 3D Euclidean distances
+            "B3") total_features=22 ;; # B0(3) + B1(7) + B2(8) + B3(4) - AU features using 3D displacement magnitudes
             *) total_features="unknown" ;;
         esac
         log "  Cumulative feature count: ${total_features} features per node (${TARGET_FEATURE_LEVEL} file is self-contained)"

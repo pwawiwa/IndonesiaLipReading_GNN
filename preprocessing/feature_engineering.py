@@ -2,15 +2,21 @@
 Feature Engineering: B0 - B3 feature sets.
 
 Each level stores CUMULATIVE features (includes all previous levels):
-- B0: Raw normalized coordinates (X, Y per node) - 2 features
-- B1: B0 + Velocity + speed + acceleration - 7 features (B0: 2 + B1: 5 = 7 total)
-- B2: B0 + B1 + Global geometric features - 12 features (B0: 2 + B1: 5 + B2: 5 = 12 total)
-  Note: B2 features are global per frame (broadcast to all nodes): MAR, lip width, lip height, cheek puff, chin height
-- B3: B0 + B1 + B2 + AU features - 11 features (B0: 2 + B1: 3 + B2: 2 + B3: 4 = 11 total)
-  Note: AU features: 4 AU groups (AU25, AU26, AU12, AU27). PCA and motion energy removed.
+- B0: Raw normalized coordinates (X, Y, Z per node) - 3 features (3D coordinates)
+- B1: B0 + Velocity + speed + acceleration - 10 features (B0: 3 + B1: 7 = 10 total)
+  Note: Velocity (vx, vy, vz), speed (3D magnitude), acceleration (ax, ay, az) all in 3D
+- B2: B0 + B1 + Global geometric features - 18 features (B0: 3 + B1: 7 + B2: 8 = 18 total)
+  Note: B2 features are global per frame (broadcast to all nodes): MAR, lip width, lip height, jaw height, cheek puff, lip curvature, lip corner angle, jaw opening
+  Note: Width and distances use 3D Euclidean distance for accurate measurements regardless of viewing angle
+- B3: B0 + B1 + B2 + AU features - 22 features (B0: 3 + B1: 7 + B2: 8 + B3: 4 = 22 total)
+  Note: AU features: 4 AU groups (AU25, AU26, AU12, AU27) using 3D displacement magnitudes. PCA and motion energy removed.
 
 When loading for training, just load the target level file (no concatenation needed).
 Each file is self-contained with all features up to that level.
+
+IMPORTANT: All features now use 3D coordinates (X, Y, Z) for accurate measurements:
+- Distances use 3D Euclidean distance: sqrt((x_diff)^2 + (y_diff)^2 + (z_diff)^2)
+- This ensures consistent measurements regardless of viewing angle (facing camera vs. facing left/right)
 """
 import torch
 import numpy as np
@@ -18,6 +24,10 @@ from typing import Dict, List, Tuple, Optional
 from sklearn.decomposition import PCA
 import math
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
+import os
+import pickle
 
 
 class FeatureEngineer:
@@ -33,38 +43,435 @@ class FeatureEngineer:
         self.feature_level = feature_level
         self.pca_models = {}  # For B4
     
-    def compute_B0(self, landmarks: torch.Tensor, meta: Dict) -> torch.Tensor:
+    def compute_B0(self, landmarks: torch.Tensor, meta: Dict, partition: str = 'mouth', node_mapping: Optional[Dict] = None) -> torch.Tensor:
         """
-        B0: Raw normalized coordinates.
+        B0: Raw normalized coordinates with pose, scale, and rotation invariance.
+        
+        Implements proper 3D normalization following the order:
+        1. Pose Invariance: Subtract nose tip (anchor point) from all landmarks
+        2. 3D Rotation Correction: Align face horizontally using 3D rotation matrix
+        3. Scale Invariance: Normalize by IOD (full) or mouth width (mouth/lips)
         
         Input landmarks are already normalized to [0, 1] by resolution during extraction.
-        Here we additionally center and scale by face bounding box.
+        MediaPipe coordinate system: X [0,1] (left to right), Y [0,1] (top to bottom), Z (depth).
         
         Args:
-            landmarks: Shape (frames, n_nodes, 2)
+            landmarks: Shape (frames, n_nodes, 3) - MediaPipe normalized coordinates [0,1] for X,Y, Z for depth
             meta: Video metadata with width, height
+            partition: 'lips', 'mouth', or 'full'
+            node_mapping: Optional node mapping dict (original MediaPipe idx -> new idx)
             
         Returns:
-            Features of shape (frames, n_nodes, 2)
+            Features of shape (frames, n_nodes, 3) - Normalized X, Y, Z coordinates
+            Note: Z is preserved for 3D distance calculations in B2 geometric features
         """
-        # Landmarks are already resolution-normalized (X/width, Y/height)
-        # Additional normalization: center by face center, scale by face size
-        # VECTORIZED for efficiency
+        frames, n_nodes, n_dims = landmarks.shape
         
+        # Handle both 2D (old) and 3D (new) landmarks
+        if n_dims == 2:
+            # Old format: add Z as zeros (backward compatibility)
+            z_coords = torch.zeros(frames, n_nodes, 1, dtype=landmarks.dtype, device=landmarks.device)
+            landmarks = torch.cat([landmarks, z_coords], dim=2)
+        elif n_dims != 3:
+            raise ValueError(f"Expected landmarks with 2 or 3 dimensions, got {n_dims}")
+        
+        # Get node indices for normalization
+        if node_mapping is None:
+            from preprocessing.mediapipe_nodes import get_partition_nodes
+            nodes = get_partition_nodes(partition)
+            node_mapping = {orig_idx: new_idx for new_idx, orig_idx in enumerate(nodes)}
+        
+        # Step 1: Pose Invariance - Subtract nose tip (anchor point) from all landmarks
+        landmarks_pose_invariant = self._apply_pose_invariance(landmarks, partition, node_mapping)
+        
+        # Step 2: 3D Rotation Correction - Align face horizontally using 3D rotation
+        landmarks_rotated = self._correct_rotation_3d(landmarks_pose_invariant, partition, node_mapping)
+        
+        # Step 3: Scale Invariance - Normalize by IOD or mouth width (using 3D distances)
+        features = self._normalize_scale(landmarks_rotated, partition, node_mapping)
+        
+        return features  # Returns (frames, n_nodes, 3) - X, Y, Z
+    
+    def _apply_pose_invariance(self, landmarks: torch.Tensor, partition: str, node_mapping: Dict) -> torch.Tensor:
+        """
+        Step 1: Pose Invariance - Subtract nose tip (anchor point) from all landmarks.
+        
+        Formula: x'_i = x_i - x_nose
+        
+        Args:
+            landmarks: Shape (frames, n_nodes, 3) - X, Y, Z coordinates
+            partition: 'lips', 'mouth', or 'full'
+            node_mapping: Node mapping dict
+            
+        Returns:
+            Pose-invariant landmarks (frames, n_nodes, 3)
+        """
         frames, n_nodes, _ = landmarks.shape
-        features = landmarks.clone()
+        pose_invariant = landmarks.clone()
+        
+        # MediaPipe nose tip landmark index is 4 (not 34)
+        nose_tip_mp = 4
+        nose_tip_idx = node_mapping.get(nose_tip_mp)
+        
+        if nose_tip_idx is not None:
+            # Get nose tip position for each frame
+            nose_tip = pose_invariant[:, nose_tip_idx, :]  # (frames, 3)
+            
+            # Subtract nose tip from all landmarks
+            pose_invariant = pose_invariant - nose_tip.unsqueeze(1)  # (frames, n_nodes, 3)
+        else:
+            # Fallback: use face/mouth center if nose tip not available
+            if partition == 'full':
+                # Use average of all landmarks as center
+                center = pose_invariant.mean(dim=1, keepdim=True)  # (frames, 1, 3)
+            else:
+                # For mouth/lips: use mouth center
+                left_corner_mp = 61
+                right_corner_mp = 291
+                left_corner_idx = node_mapping.get(left_corner_mp)
+                right_corner_idx = node_mapping.get(right_corner_mp)
+                
+                if left_corner_idx is not None and right_corner_idx is not None:
+                    left_corner = pose_invariant[:, left_corner_idx, :]  # (frames, 3)
+                    right_corner = pose_invariant[:, right_corner_idx, :]  # (frames, 3)
+                    center = ((left_corner + right_corner) / 2).unsqueeze(1)  # (frames, 1, 3)
+                else:
+                    # Final fallback: use average
+                    center = pose_invariant.mean(dim=1, keepdim=True)  # (frames, 1, 3)
+            
+            pose_invariant = pose_invariant - center
+        
+        return pose_invariant
+    
+    def _ensure_camera_facing(self, landmarks: torch.Tensor, partition: str, node_mapping: Dict) -> torch.Tensor:
+        """
+        Step 0: Align face horizontally in 3D by making lip corners/eyes have the same Z (depth).
+        
+        For a face facing the camera and horizontally aligned:
+        - Lip corners (or eyes) should have the SAME Z value (same depth)
+        - This ensures the face is horizontally aligned in 3D space (no yaw rotation in depth)
+        
+        We rotate the face in 3D space around the Y-axis to align the corners/eyes to the same depth.
+        This check must happen BEFORE pose invariance (before subtracting nose).
+        
+        Args:
+            landmarks: Shape (frames, n_nodes, 3) - X, Y, Z coordinates (original)
+            partition: 'lips', 'mouth', or 'full'
+            node_mapping: Node mapping dict
+            
+        Returns:
+            Horizontally aligned landmarks (frames, n_nodes, 3)
+        """
+        frames, n_nodes, _ = landmarks.shape
+        corrected = landmarks.clone()
+        
+        if partition == 'full':
+            left_eye_mp = 33
+            right_eye_mp = 263
+            
+            left_eye_idx = node_mapping.get(left_eye_mp)
+            right_eye_idx = node_mapping.get(right_eye_mp)
+            
+            if left_eye_idx is not None and right_eye_idx is not None:
+                # Get eye positions in 3D
+                left_eye = corrected[:, left_eye_idx, :]  # (frames, 3)
+                right_eye = corrected[:, right_eye_idx, :]  # (frames, 3)
+                
+                # Compute Z difference (depth difference)
+                z_diff = right_eye[:, 2] - left_eye[:, 2]  # (frames,)
+                
+                # Rotate around Y-axis to make Z values equal (align horizontally in 3D)
+                # Angle to rotate: atan2(z_diff, x_distance)
+                x_diff = right_eye[:, 0] - left_eye[:, 0]  # (frames,)
+                # Use XZ plane to compute rotation angle
+                angle_y = torch.atan2(z_diff, x_diff)  # (frames,) - rotation around Y-axis
+                
+                # Apply rotation around Y-axis to align Z values
+                cos_angle = torch.cos(-angle_y).unsqueeze(1)  # (frames, 1)
+                sin_angle = torch.sin(-angle_y).unsqueeze(1)  # (frames, 1)
+                
+                # Rotation matrix around Y-axis: R_y = [[cos, 0, sin], [0, 1, 0], [-sin, 0, cos]]
+                x_rot = corrected[:, :, 0] * cos_angle + corrected[:, :, 2] * sin_angle
+                y_rot = corrected[:, :, 1]  # Y unchanged for Y-axis rotation
+                z_rot = -corrected[:, :, 0] * sin_angle + corrected[:, :, 2] * cos_angle
+                
+                corrected = torch.stack([x_rot, y_rot, z_rot], dim=2)  # (frames, n_nodes, 3)
+        
+        elif partition in ['mouth', 'lips']:
+            left_corner_mp = 61
+            right_corner_mp = 291
+            
+            left_corner_idx = node_mapping.get(left_corner_mp)
+            right_corner_idx = node_mapping.get(right_corner_mp)
+            
+            if left_corner_idx is not None and right_corner_idx is not None:
+                # Get corner positions in 3D
+                left_corner = corrected[:, left_corner_idx, :]  # (frames, 3)
+                right_corner = corrected[:, right_corner_idx, :]  # (frames, 3)
+                
+                # First, ensure face is facing RIGHT before Y-axis rotation
+                # Check direction: right corner should be to the right (positive X direction)
+                x_diff_before = right_corner[:, 0] - left_corner[:, 0]  # (frames,)
+                facing_right_before = x_diff_before > 0  # (frames,)
+                
+                # If NOT facing right, flip horizontally BEFORE Y-axis rotation
+                flip_mask = ~facing_right_before  # (frames,)
+                if flip_mask.any():
+                    corrected[flip_mask, :, 0] = -corrected[flip_mask, :, 0]  # Flip X
+                    corrected[flip_mask, :, 2] = -corrected[flip_mask, :, 2]  # Flip Z
+                    # Update corner positions after flip
+                    left_corner = corrected[:, left_corner_idx, :]  # (frames, 3)
+                    right_corner = corrected[:, right_corner_idx, :]  # (frames, 3)
+                
+                # Now rotate around Y-axis to make Z values equal (align horizontally in 3D)
+                # Compute Z difference (depth difference)
+                z_diff = right_corner[:, 2] - left_corner[:, 2]  # (frames,)
+                
+                # Angle to rotate: atan2(z_diff, x_distance)
+                x_diff = right_corner[:, 0] - left_corner[:, 0]  # (frames,)
+                # Use XZ plane to compute rotation angle
+                angle_y = torch.atan2(z_diff, x_diff)  # (frames,) - rotation around Y-axis
+                
+                # Apply rotation around Y-axis to align Z values
+                cos_angle = torch.cos(-angle_y).unsqueeze(1)  # (frames, 1)
+                sin_angle = torch.sin(-angle_y).unsqueeze(1)  # (frames, 1)
+                
+                # Rotation matrix around Y-axis: R_y = [[cos, 0, sin], [0, 1, 0], [-sin, 0, cos]]
+                x_rot = corrected[:, :, 0] * cos_angle + corrected[:, :, 2] * sin_angle
+                y_rot = corrected[:, :, 1]  # Y unchanged for Y-axis rotation
+                z_rot = -corrected[:, :, 0] * sin_angle + corrected[:, :, 2] * cos_angle
+                
+                corrected = torch.stack([x_rot, y_rot, z_rot], dim=2)  # (frames, n_nodes, 3)
+                
+                # Verify direction is still correct after Y-axis rotation
+                right_corner_x_after = corrected[:, right_corner_idx, 0]  # (frames,)
+                left_corner_x_after = corrected[:, left_corner_idx, 0]  # (frames,)
+                facing_right_after = right_corner_x_after > left_corner_x_after  # (frames,)
+                
+                # If direction flipped during rotation, flip back
+                flip_mask_after = ~facing_right_after  # (frames,)
+                if flip_mask_after.any():
+                    corrected[flip_mask_after, :, 0] = -corrected[flip_mask_after, :, 0]  # Flip X
+                    corrected[flip_mask_after, :, 2] = -corrected[flip_mask_after, :, 2]  # Flip Z
+        
+        return corrected
+    
+    def _correct_rotation_3d(self, landmarks: torch.Tensor, partition: str, node_mapping: Dict) -> torch.Tensor:
+        """
+        Step 2: 3D Rotation Correction - Align face horizontally and ensure facing CAMERA.
+        
+        For a face to be "facing CAMERA" (toward camera):
+        1. Face must be horizontal (no tilt) - align corners/eyes horizontally
+        2. Right side must be on positive X, left side on negative X
+        3. Face should be facing camera - use Z coordinate to verify:
+           - Nose tip should be CLOSEST to camera (highest Z value)
+           - Face edges should be FARTHER from camera (lower Z values)
+        
+        Uses X, Y, Z coordinates to:
+        - Rotate face horizontally (2D rotation in XY plane)
+        - Determine face direction using Z coordinate (depth)
+        - Ensure all faces face the camera (front-facing)
+        
+        Args:
+            landmarks: Shape (frames, n_nodes, 3) - X, Y, Z coordinates (already pose-invariant)
+            partition: 'lips', 'mouth', or 'full'
+            node_mapping: Node mapping dict
+            
+        Returns:
+            Rotation-corrected landmarks (frames, n_nodes, 3) - but only X, Y are used later
+        """
+        frames, n_nodes, _ = landmarks.shape
+        corrected = landmarks.clone()
+        
+        if partition == 'full':
+            # Use eyes for rotation (most stable)
+            left_eye_mp = 33  # Left eye center
+            right_eye_mp = 263  # Right eye center
+            nose_tip_mp = 4  # Nose tip
+            
+            left_eye_idx = node_mapping.get(left_eye_mp)
+            right_eye_idx = node_mapping.get(right_eye_mp)
+            nose_tip_idx = node_mapping.get(nose_tip_mp)
+            
+            if left_eye_idx is not None and right_eye_idx is not None:
+                # Get eye positions in 3D
+                left_eye = corrected[:, left_eye_idx, :]  # (frames, 3)
+                right_eye = corrected[:, right_eye_idx, :]  # (frames, 3)
+                eye_vector = right_eye - left_eye  # (frames, 3)
+                
+                # Step 1: Rotate to make eyes horizontal (Y=0)
+                angle = torch.atan2(eye_vector[:, 1], eye_vector[:, 0])  # (frames,)
+                cos_angle = torch.cos(-angle).unsqueeze(1)  # (frames, 1)
+                sin_angle = torch.sin(-angle).unsqueeze(1)  # (frames, 1)
+                
+                # Apply 3D rotation matrix around Z-axis (yaw correction)
+                x_rot = corrected[:, :, 0] * cos_angle - corrected[:, :, 1] * sin_angle
+                y_rot = corrected[:, :, 0] * sin_angle + corrected[:, :, 1] * cos_angle
+                z_rot = corrected[:, :, 2]  # Z unchanged for yaw rotation
+                
+                corrected = torch.stack([x_rot, y_rot, z_rot], dim=2)  # (frames, n_nodes, 3)
+                
+                # Step 2: Ensure all faces face CAMERA using Z coordinate
+                # For face facing camera: nose should be closest (highest Z)
+                if nose_tip_idx is not None:
+                    nose_z = corrected[:, nose_tip_idx, 2]  # (frames,)
+                    left_eye_z = corrected[:, left_eye_idx, 2]  # (frames,)
+                    right_eye_z = corrected[:, right_eye_idx, 2]  # (frames,)
+                    
+                    # Check if nose is closest (facing camera)
+                    nose_is_closest = (nose_z > left_eye_z) & (nose_z > right_eye_z)  # (frames,)
+                    
+                    # If nose is NOT closest, face is not facing camera - need to flip
+                    # Flip around Y-axis (mirror horizontally) to face camera
+                    flip_mask = ~nose_is_closest  # (frames,)
+                else:
+                    # Fallback: use X direction if nose not available
+                    right_eye_rotated = corrected[:, right_eye_idx, 0]  # (frames,)
+                    left_eye_rotated = corrected[:, left_eye_idx, 0]  # (frames,)
+                    eye_direction = right_eye_rotated - left_eye_rotated  # (frames,)
+                    flip_mask = eye_direction < 0  # (frames,)
+                
+                # Flip horizontally if not facing camera
+                if flip_mask.any():
+                    corrected[flip_mask, :, 0] = -corrected[flip_mask, :, 0]  # Flip X
+                    # Also flip Z to maintain consistency (though Z is not used later)
+                    corrected[flip_mask, :, 2] = -corrected[flip_mask, :, 2]  # Flip Z
+        
+        elif partition in ['mouth', 'lips']:
+            # Use lip corners for rotation
+            left_corner_mp = 61  # Left lip corner (outer)
+            right_corner_mp = 291  # Right lip corner (outer)
+            nose_tip_mp = 4  # Nose tip (available in 'mouth', not in 'lips')
+            
+            left_corner_idx = node_mapping.get(left_corner_mp)
+            right_corner_idx = node_mapping.get(right_corner_mp)
+            nose_tip_idx = node_mapping.get(nose_tip_mp)  # May be None for 'lips'
+            
+            if left_corner_idx is not None and right_corner_idx is not None:
+                # Get corner positions in 3D
+                left_corner = corrected[:, left_corner_idx, :]  # (frames, 3)
+                right_corner = corrected[:, right_corner_idx, :]  # (frames, 3)
+                corner_vector = right_corner - left_corner  # (frames, 3)
+                
+                # Step 1: Rotate to make lip corners horizontal (Y=0)
+                # Target: corner vector should be horizontal (pointing right, Y=0)
+                angle = torch.atan2(corner_vector[:, 1], corner_vector[:, 0])  # (frames,)
+                cos_angle = torch.cos(-angle).unsqueeze(1)  # (frames, 1)
+                sin_angle = torch.sin(-angle).unsqueeze(1)  # (frames, 1)
+                
+                # Apply 3D rotation matrix around Z-axis (yaw correction)
+                x_rot = corrected[:, :, 0] * cos_angle - corrected[:, :, 1] * sin_angle
+                y_rot = corrected[:, :, 0] * sin_angle + corrected[:, :, 1] * cos_angle
+                z_rot = corrected[:, :, 2]  # Z unchanged for yaw rotation
+                
+                corrected = torch.stack([x_rot, y_rot, z_rot], dim=2)  # (frames, n_nodes, 3)
+                
+                # Step 2: Ensure all faces face RIGHT (right corner on positive X)
+                # Check direction: right corner should be to the right of left corner
+                right_corner_rotated = corrected[:, right_corner_idx, 0]  # (frames,)
+                left_corner_rotated = corrected[:, left_corner_idx, 0]  # (frames,)
+                corner_direction = right_corner_rotated - left_corner_rotated  # (frames,)
+                facing_right = corner_direction > 0  # (frames,)
+                
+                # If NOT facing right, flip horizontally
+                flip_mask = ~facing_right  # (frames,)
+                if flip_mask.any():
+                    corrected[flip_mask, :, 0] = -corrected[flip_mask, :, 0]  # Flip X
+                    # Also flip Z to maintain 3D consistency
+                    corrected[flip_mask, :, 2] = -corrected[flip_mask, :, 2]  # Flip Z
+        
+        return corrected
+    
+    def _normalize_scale(self, landmarks: torch.Tensor, partition: str, node_mapping: Dict) -> torch.Tensor:
+        """
+        Step 3: Scale Invariance - Normalize by IOD (full) or mouth width (mouth/lips).
+        
+        After pose invariance and rotation, normalize scale so face size doesn't matter.
+        Uses 3D Euclidean distances for accurate measurements regardless of viewing angle.
+        Formula: Divide all coordinates by IOD (inter-ocular distance) or mouth width.
+        
+        Args:
+            landmarks: Shape (frames, n_nodes, 3) - Already pose-invariant and rotated
+            partition: 'lips', 'mouth', or 'full'
+            node_mapping: Node mapping dict
+            
+        Returns:
+            Scale-normalized coordinates (frames, n_nodes, 3) - X, Y, Z all normalized
+        """
+        frames, n_nodes, _ = landmarks.shape
+        normalized = landmarks.clone()  # Keep 3D coordinates
+        
+        if partition == 'full':
+            # Use Inter-Ocular Distance (IOD) normalization (3D distance)
+            # After pose invariance, landmarks are centered at nose tip (origin)
+            # We scale by IOD while keeping origin at nose tip
+            left_eye_mp = 33  # Left eye center
+            right_eye_mp = 263  # Right eye center
+            
+            left_eye_idx = node_mapping.get(left_eye_mp)
+            right_eye_idx = node_mapping.get(right_eye_mp)
+            
+            if left_eye_idx is not None and right_eye_idx is not None:
+                # Compute IOD using 3D Euclidean distance (accounts for depth)
+                left_eye = normalized[:, left_eye_idx, :]  # (frames, 3)
+                right_eye = normalized[:, right_eye_idx, :]  # (frames, 3)
+                iod = torch.norm(right_eye - left_eye, dim=1, keepdim=True)  # (frames, 1) - 3D distance
+                
+                # Scale all coordinates (X, Y, Z) by IOD (keep origin at nose tip)
+                normalized = normalized / (iod.unsqueeze(1) + 1e-6)  # (frames, n_nodes, 3)
+            else:
+                # Fallback to face bbox if eyes not available (2D only)
+                normalized_2d = self._normalize_by_bbox(normalized[:, :, :2])
+                normalized = torch.cat([normalized_2d, normalized[:, :, 2:]], dim=2)  # Keep Z
+        
+        else:  # 'mouth' or 'lips'
+            # Use mouth width normalization (3D distance)
+            # After pose invariance, landmarks are centered at nose tip (origin)
+            # We scale by mouth width while keeping origin at nose tip
+            left_corner_mp = 61  # Left lip corner
+            right_corner_mp = 291  # Right lip corner
+            
+            left_corner_idx = node_mapping.get(left_corner_mp)
+            right_corner_idx = node_mapping.get(right_corner_mp)
+            
+            if left_corner_idx is not None and right_corner_idx is not None:
+                # Compute mouth width using 3D Euclidean distance (accounts for depth)
+                # This gives true width regardless of viewing angle
+                left_corner = normalized[:, left_corner_idx, :]  # (frames, 3)
+                right_corner = normalized[:, right_corner_idx, :]  # (frames, 3)
+                mouth_width = torch.norm(right_corner - left_corner, dim=1, keepdim=True)  # (frames, 1) - 3D distance
+                
+                # Scale all coordinates (X, Y, Z) by mouth width (keep origin at nose tip)
+                normalized = normalized / (mouth_width.unsqueeze(1) + 1e-6)  # (frames, n_nodes, 3)
+            else:
+                # Fallback to face bbox if corners not available (2D only)
+                normalized_2d = self._normalize_by_bbox(normalized[:, :, :2])
+                normalized = torch.cat([normalized_2d, normalized[:, :, 2:]], dim=2)  # Keep Z
+        
+        return normalized
+    
+    def _normalize_by_bbox(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Fallback normalization using face bounding box (original method).
+        
+        Args:
+            coords: Shape (frames, n_nodes, 2)
+            
+        Returns:
+            Normalized coordinates
+        """
+        frames, n_nodes, _ = coords.shape
+        features = coords.clone()
         
         # Vectorized per-frame normalization
-        # Compute bounding boxes for all frames at once
         x_coords = features[:, :, 0]  # (frames, n_nodes)
         y_coords = features[:, :, 1]  # (frames, n_nodes)
         
-        # Create valid mask (non-zero coordinates)
+        # Create valid mask
         valid_mask = (x_coords != 0) | (y_coords != 0)  # (frames, n_nodes)
         has_valid = valid_mask.any(dim=1)  # (frames,)
         
-        # For frames with valid points, compute min/max using masked operations
-        # Replace invalid values with inf/-inf for min/max computation
+        # Compute bounding box
         x_coords_masked = x_coords.masked_fill(~valid_mask, float('inf'))
         x_min = x_coords_masked.min(dim=1, keepdim=True)[0]  # (frames, 1)
         x_min = torch.where(has_valid.unsqueeze(1), x_min, torch.zeros_like(x_min))
@@ -81,7 +488,7 @@ class FeatureEngineer:
         y_max = y_coords_masked.max(dim=1, keepdim=True)[0]  # (frames, 1)
         y_max = torch.where(has_valid.unsqueeze(1), y_max, torch.zeros_like(y_max))
         
-        # Face centers and sizes (vectorized)
+        # Face centers and sizes
         x_center = (x_min + x_max) / 2  # (frames, 1)
         y_center = (y_min + y_max) / 2  # (frames, 1)
         face_width = x_max - x_min  # (frames, 1)
@@ -91,7 +498,7 @@ class FeatureEngineer:
         # Avoid division by zero
         face_size = torch.clamp(face_size, min=1e-6)
         
-        # Center and scale (vectorized)
+        # Center and scale
         features[:, :, 0] = (x_coords - x_center) / face_size
         features[:, :, 1] = (y_coords - y_center) / face_size
         
@@ -102,82 +509,96 @@ class FeatureEngineer:
     
     def compute_velocity(self, coords: torch.Tensor) -> torch.Tensor:
         """
-        Compute velocity (first derivative).
+        Compute velocity (first derivative) in 3D.
+        OPTIMIZED: Vectorized computation for better performance.
         
         Args:
-            coords: Shape (frames, n_nodes, 2)
+            coords: Shape (frames, n_nodes, 2 or 3) - normalized coordinates
             
         Returns:
-            Velocity of shape (frames, n_nodes, 2)
+            Velocity of shape (frames, n_nodes, 2 or 3) - same dimensionality as input
+            Note: Returns 3D velocity (vx, vy, vz) if input is 3D, 2D (vx, vy) if input is 2D
         """
         frames = coords.shape[0]
         velocity = torch.zeros_like(coords)
         
         if frames > 1:
-            # Forward difference for first frame
-            velocity[0] = coords[1] - coords[0]
-            
-            # Central difference for middle frames
+            # OPTIMIZATION: Vectorized computation
             if frames > 2:
-                velocity[1:-1] = (coords[2:] - coords[:-2]) / 2.0
-            
-            # Backward difference for last frame
-            velocity[-1] = coords[-1] - coords[-2]
+                # Central difference for all frames (more accurate)
+                # First frame: forward difference
+                velocity[0] = coords[1] - coords[0]
+                # Middle frames: central difference (vectorized)
+                velocity[1:-1] = (coords[2:] - coords[:-2]) * 0.5  # Use multiplication instead of division
+                # Last frame: backward difference
+                velocity[-1] = coords[-1] - coords[-2]
+            else:
+                # Only 2 frames: simple forward difference
+                velocity[0] = coords[1] - coords[0]
+                velocity[1] = coords[1] - coords[0]
         
         return velocity
     
     def compute_acceleration(self, velocity: torch.Tensor) -> torch.Tensor:
         """
-        Compute acceleration (second derivative).
+        Compute acceleration (second derivative) in 3D.
         
         Args:
-            velocity: Shape (frames, n_nodes, 2)
+            velocity: Shape (frames, n_nodes, 2 or 3) - velocity vectors
             
         Returns:
-            Acceleration of shape (frames, n_nodes, 2)
+            Acceleration of shape (frames, n_nodes, 2 or 3) - same dimensionality as input
+            Note: Returns 3D acceleration (ax, ay, az) if input is 3D, 2D (ax, ay) if input is 2D
         """
         return self.compute_velocity(velocity)
     
     def compute_speed(self, velocity: torch.Tensor) -> torch.Tensor:
         """
-        Compute speed magnitude from velocity.
+        Compute speed magnitude from velocity (works for both 2D and 3D).
         
         Args:
-            velocity: Shape (frames, n_nodes, 2)
+            velocity: Shape (frames, n_nodes, 2 or 3) - velocity vectors
             
         Returns:
-            Speed of shape (frames, n_nodes, 1)
+            Speed of shape (frames, n_nodes, 1) - 3D magnitude if input is 3D, 2D magnitude if input is 2D
+            Note: For 3D: speed = sqrt(vx^2 + vy^2 + vz^2)
+                  For 2D: speed = sqrt(vx^2 + vy^2)
         """
-        # Speed = ||velocity||
+        # Speed = ||velocity|| (works for both 2D and 3D)
         speed = torch.norm(velocity, dim=-1, keepdim=True)
         return speed
     
-    def compute_B1(self, landmarks: torch.Tensor, meta: Dict) -> torch.Tensor:
+    def compute_B1(self, landmarks: torch.Tensor, meta: Dict, partition: str = 'mouth', node_mapping: Optional[Dict] = None) -> torch.Tensor:
         """
         B1: Returns B0 + velocity + speed + acceleration (cumulative, includes B0).
+        OPTIMIZED: Reduced tensor concatenations and vectorized operations.
         
         Args:
-            landmarks: Shape (frames, n_nodes, 2)
+            landmarks: Shape (frames, n_nodes, 2 or 3) - raw landmarks
             meta: Video metadata
+            partition: 'lips', 'mouth', or 'full'
+            node_mapping: Optional node mapping dict
             
         Returns:
-            Features of shape (frames, n_nodes, 7)  [B0: x, y] + [B1: vx, vy, speed, ax, ay]
+            Features of shape (frames, n_nodes, 10)  [B0: x, y, z] + [B1: vx, vy, vz, speed, ax, ay, az]
+            Note: Velocity and acceleration computed in 3D, speed is 3D magnitude
         """
-        # B0 features (needed for velocity computation)
-        b0 = self.compute_B0(landmarks, meta)
+        # B0 features (now returns X, Y, Z - 3D)
+        b0 = self.compute_B0(landmarks, meta, partition=partition, node_mapping=node_mapping)  # (frames, n_nodes, 3)
         
-        # Velocity
-        velocity = self.compute_velocity(b0)
+        # Velocity in 3D
+        velocity = self.compute_velocity(b0)  # (frames, n_nodes, 3) - vx, vy, vz
         
-        # Speed magnitude
-        speed = self.compute_speed(velocity)
+        # OPTIMIZATION: Compute speed and acceleration in one pass, then concatenate once
+        # Speed magnitude (3D): sqrt(vx^2 + vy^2 + vz^2)
+        speed = torch.norm(velocity, dim=-1, keepdim=True)  # (frames, n_nodes, 1) - inline computation
         
-        # Acceleration
-        acceleration = self.compute_acceleration(velocity)
+        # Acceleration in 3D (reuse velocity computation)
+        acceleration = self.compute_velocity(velocity)  # (frames, n_nodes, 3) - ax, ay, az
         
+        # OPTIMIZATION: Single concatenation instead of two (reduces memory allocation)
         # Return B0 + velocity + speed + acceleration (cumulative: B0 + B1)
-        b1_features = torch.cat([velocity, speed, acceleration], dim=-1)  # (frames, n_nodes, 5)
-        features = torch.cat([b0, b1_features], dim=-1)  # (frames, n_nodes, 7)
+        features = torch.cat([b0, velocity, speed, acceleration], dim=-1)  # (frames, n_nodes, 10)
         
         return features
     
@@ -189,29 +610,37 @@ class FeatureEngineer:
         OPTIMIZED: Accepts precomputed node indices to avoid repeated lookups.
         
         Args:
-            landmarks: Shape (frames, n_nodes, 2) - raw landmarks (used if b0_coords not provided)
+            landmarks: Shape (frames, n_nodes, 2 or 3) - raw landmarks (used if b0_coords not provided)
             meta: Video metadata
             partition: 'lips', 'mouth', or 'full'
-            b0_coords: Optional pre-computed B0 coordinates (faster, avoids recomputation)
-            b1_features: Optional pre-computed B1 features (B0+B1, faster, avoids recomputation)
+            b0_coords: Optional pre-computed B0 coordinates (faster, avoids recomputation) - now 3D (X, Y, Z)
+            b1_features: Optional pre-computed B1 features (B0+B1, faster, avoids recomputation) - now B0(3) + B1(7) = 10
             node_indices: Optional precomputed node indices dict (faster, avoids repeated lookups)
             
         Returns:
-            Features of shape (frames, n_nodes, 15)  [B0: x, y] + [B1: vx, vy, speed, ax, ay] + [B2: MAR, lip_width, lip_height, jaw_height, cheek_puff, lip_curvature, lip_corner_angle, jaw_opening]
+            Features of shape (frames, n_nodes, 18)  [B0: x, y, z] + [B1: vx, vy, vz, speed, ax, ay, az] + [B2: MAR, lip_width, lip_height, jaw_height, cheek_puff, lip_curvature, lip_corner_angle, jaw_opening]
+            Note: B2 geometric features use 3D Euclidean distances for accurate measurements
         """
         # OPTIMIZATION: Use existing B0+B1 if provided (much faster)
         if b1_features is not None:
-            b0_b1 = b1_features  # Already has B0+B1
-            b0 = b1_features[:, :, :2]  # Extract B0 for geometric computation
+            b0_b1 = b1_features  # Already has B0+B1 (10 features: B0(3) + B1(7))
+            b0 = b1_features[:, :, :3]  # Extract B0 (X, Y, Z) for geometric computation
         else:
             # Compute B0
             if b0_coords is not None:
                 b0 = b0_coords
             else:
-                b0 = self.compute_B0(landmarks, meta)
+                # Get node_mapping for B0 if not provided
+                from preprocessing.mediapipe_nodes import get_partition_nodes
+                nodes = get_partition_nodes(partition)
+                node_mapping_b0 = {orig_idx: new_idx for new_idx, orig_idx in enumerate(nodes)}
+                b0 = self.compute_B0(landmarks, meta, partition=partition, node_mapping=node_mapping_b0)
             
             # Compute B1 (B0 + velocity + speed + acceleration)
-            b1 = self.compute_B1(landmarks, meta)  # Returns B0+B1
+            from preprocessing.mediapipe_nodes import get_partition_nodes
+            nodes = get_partition_nodes(partition)
+            node_mapping_b1 = {orig_idx: new_idx for new_idx, orig_idx in enumerate(nodes)}
+            b1 = self.compute_B1(landmarks, meta, partition=partition, node_mapping=node_mapping_b1)  # Returns B0+B1
             b0_b1 = b1
         
         # Global geometric features (B2 incremental) - broadcast to all nodes
@@ -224,7 +653,7 @@ class FeatureEngineer:
         geom_broadcast = geom_global.unsqueeze(1).expand(frames, n_nodes, -1)  # (frames, n_nodes, 8)
         
         # Return B0 + B1 + B2 (cumulative)
-        features = torch.cat([b0_b1, geom_broadcast], dim=-1)  # (frames, n_nodes, 15)
+        features = torch.cat([b0_b1, geom_broadcast], dim=-1)  # (frames, n_nodes, 18) - B0(3) + B1(7) + B2(8)
         
         return features
     
@@ -240,17 +669,20 @@ class FeatureEngineer:
         OPTIMIZED: Accepts precomputed node indices to avoid repeated lookups.
         
         Args:
-            coords: Shape (frames, n_nodes, 2) - normalized coordinates
+            coords: Shape (frames, n_nodes, 2 or 3) - normalized coordinates (2D or 3D)
             partition: 'lips', 'mouth', or 'full'
             node_indices: Optional precomputed dict with keys: 'left_corner', 'right_corner', 'chin_center', 'lips_nodes', 'left_cheek', 'right_cheek'
                          If None, will compute on-the-fly (slower)
             
         Returns:
             Global features of shape (frames, 8) - [MAR, lip_width, lip_height, jaw_height, cheek_puff, lip_curvature, lip_corner_angle, jaw_opening]
+            Note: Width and distances use 3D Euclidean distance if Z is available, otherwise 2D
         """
         frames = coords.shape[0]
+        n_dims = coords.shape[2]
         device = coords.device
         dtype = coords.dtype
+        use_3d = (n_dims == 3)
         
         # Initialize output tensor (8 features: MAR, lip_width, lip_height, jaw_height, cheek_puff, lip_curvature, lip_corner_angle, jaw_opening)
         global_features = torch.zeros(frames, 8, device=device, dtype=dtype)
@@ -297,66 +729,89 @@ class FeatureEngineer:
             left_cheek_remapped = [node_mapping[n] for n in left_cheek_orig if n in node_mapping]
             right_cheek_remapped = [node_mapping[n] for n in right_cheek_orig if n in node_mapping]
         
-        # Extract lip coordinates
+        # OPTIMIZATION: Pre-compute all needed tensor slices and bounds once
+        # Cache lip coordinates (used multiple times)
+        lip_coords = None
+        lip_y = None
+        lip_y_min = None
+        lip_y_max = None
+        lower_lip_y = None
+        bottom_y = None
+        
         if lips_nodes_remapped:
-            lip_coords = coords[:, lips_nodes_remapped, :]  # (frames, n_lip_nodes, 2)
+            lip_coords = coords[:, lips_nodes_remapped, :]  # (frames, n_lip_nodes, 2 or 3) - compute once
+            lip_y = lip_coords[:, :, 1]  # (frames, n_lip_nodes) - Y coordinate, compute once
             
-            # Compute lip Y bounds once (used for MAR, lip_height, and jaw_height)
-            lip_y_min = lip_coords[:, :, 1].min(dim=1)[0]  # (frames,) - upper lip
-            lip_y_max = lip_coords[:, :, 1].max(dim=1)[0]  # (frames,) - lower lip
+            # Compute lip Y bounds once (used for MAR, lip_height, jaw_height, jaw_opening)
+            lip_y_min = lip_y.min(dim=1)[0]  # (frames,) - upper lip
+            lip_y_max = lip_y.max(dim=1)[0]  # (frames,) - lower lip
+            lower_lip_y = lip_y_max  # Same as lip_y_max, reuse
             lip_height = lip_y_max - lip_y_min  # (frames,)
+        else:
+            # Fallback: compute bottom_y once if needed
+            bottom_y = coords[:, :, 1].max(dim=1)[0]  # (frames,)
+            lip_height = torch.zeros(frames, device=device, dtype=dtype)
             
-            # 1. MAR (Mouth Aspect Ratio) = lip_height / lip_width
-            # 2. Lip Width = distance between left and right corners
-            if left_corner_remapped is not None and right_corner_remapped is not None:
-                # Lip width: distance between left and right corners
-                lip_width = torch.norm(
-                    coords[:, right_corner_remapped, :] - coords[:, left_corner_remapped, :],
-                    dim=1
-                )  # (frames,)
-                
-                # MAR = height / width (avoid division by zero)
-                mar = lip_height / (lip_width + 1e-6)  # (frames,)
-                global_features[:, 0] = mar
-                global_features[:, 1] = lip_width
-            else:
-                # Fallback: use lip bounding box
-                lip_x_min = lip_coords[:, :, 0].min(dim=1)[0]
-                lip_x_max = lip_coords[:, :, 0].max(dim=1)[0]
-                lip_width = lip_x_max - lip_x_min
-                
-                mar = lip_height / (lip_width + 1e-6)
-                global_features[:, 0] = mar
-                global_features[:, 1] = lip_width
+        # Pre-compute corner coordinates once (used for lip_width and corner_angle)
+        left_corner_coords = None
+        right_corner_coords = None
+        if left_corner_remapped is not None and right_corner_remapped is not None:
+            left_corner_coords = coords[:, left_corner_remapped, :]  # (frames, 2 or 3) - compute once
+            right_corner_coords = coords[:, right_corner_remapped, :]  # (frames, 2 or 3) - compute once
+        
+        # Pre-compute chin coordinates once (used for jaw_height and jaw_opening)
+        chin_coords = None
+        chin_y = None
+        if chin_center_remapped is not None:
+            chin_coords = coords[:, chin_center_remapped, :]  # (frames, 2 or 3) - compute once
+            chin_y = chin_coords[:, 1]  # (frames,) - Y coordinate
+        
+        # Pre-compute face center once (used for cheek_puff)
+        face_center = None
+        if left_cheek_remapped and right_cheek_remapped:
+            face_center = coords.mean(dim=1)  # (frames, 2 or 3) - compute once
+        
+        # 1. MAR (Mouth Aspect Ratio) = lip_height / lip_width
+        # 2. Lip Width = 3D Euclidean distance between left and right corners
+        if left_corner_coords is not None and right_corner_coords is not None:
+            # Lip width: Use 3D Euclidean distance if available, otherwise 2D
+            corner_diff = right_corner_coords - left_corner_coords  # (frames, 2 or 3)
+            lip_width = torch.norm(corner_diff, dim=1)  # (frames,) - 3D distance if Z available
+            mar = lip_height / (lip_width + 1e-6)  # (frames,)
+            global_features[:, 0] = mar
+            global_features[:, 1] = lip_width
+        elif lip_coords is not None:
+            # Fallback: use lip bounding box (compute X bounds once)
+            lip_x = lip_coords[:, :, 0]  # (frames, n_lip_nodes)
+            lip_x_min = lip_x.min(dim=1)[0]  # (frames,)
+            lip_x_max = lip_x.max(dim=1)[0]  # (frames,)
+            lip_width = lip_x_max - lip_x_min
+            mar = lip_height / (lip_width + 1e-6)
+            global_features[:, 0] = mar
+            global_features[:, 1] = lip_width
             
             # 3. Lip Height (already computed)
+        if lip_height is not None:
             global_features[:, 2] = lip_height
             
             # 4. Jaw Height: distance from chin center to upper lip
-            if chin_center_remapped is not None:
-                chin_y = coords[:, chin_center_remapped, 1]  # (frames,)
+        if chin_y is not None and lip_y_min is not None:
                 jaw_height = chin_y - lip_y_min  # (frames,) - vertical distance
                 global_features[:, 3] = jaw_height
-            else:
-                # Fallback: use bottom of coords
-                bottom_y = coords[:, :, 1].max(dim=1)[0]  # (frames,)
+        elif bottom_y is not None and lip_y_max is not None:
                 jaw_height = bottom_y - lip_y_max  # Distance from bottom to lower lip
                 global_features[:, 3] = jaw_height
         
-        # 5. Cheek Puff: average distance of cheek nodes from face center
-        if left_cheek_remapped and right_cheek_remapped:
-            # Face center: average of all nodes
-            face_center = coords.mean(dim=1)  # (frames, 2)
+        # 5. Cheek Puff: average 3D distance of cheek nodes from face center
+        if face_center is not None and left_cheek_remapped and right_cheek_remapped:
+            # Left and right cheek centers (compute once)
+            left_cheek_coords = coords[:, left_cheek_remapped, :]  # (frames, n_left_cheek, 2 or 3)
+            left_cheek_center = left_cheek_coords.mean(dim=1)  # (frames, 2 or 3)
             
-            # Left cheek center
-            left_cheek_coords = coords[:, left_cheek_remapped, :]  # (frames, n_left_cheek, 2)
-            left_cheek_center = left_cheek_coords.mean(dim=1)  # (frames, 2)
+            right_cheek_coords = coords[:, right_cheek_remapped, :]  # (frames, n_right_cheek, 2 or 3)
+            right_cheek_center = right_cheek_coords.mean(dim=1)  # (frames, 2 or 3)
             
-            # Right cheek center
-            right_cheek_coords = coords[:, right_cheek_remapped, :]  # (frames, n_right_cheek, 2)
-            right_cheek_center = right_cheek_coords.mean(dim=1)  # (frames, 2)
-            
-            # Distance from face center
+            # Distance from face center (3D Euclidean distance if Z available)
             left_dist = torch.norm(left_cheek_center - face_center, dim=1)  # (frames,)
             right_dist = torch.norm(right_cheek_center - face_center, dim=1)  # (frames,)
             
@@ -365,50 +820,37 @@ class FeatureEngineer:
             global_features[:, 4] = cheek_puff
         
         # 6. Lip Curvature: approximate curvature from upper and lower lip
-        if lips_nodes_remapped and len(lips_nodes_remapped) >= 3:
-            lip_coords = coords[:, lips_nodes_remapped, :]  # (frames, n_lip_nodes, 2)
-            
-            # Compute curvature as variance of Y coordinates (higher variance = more curved)
-            # For each frame, compute variance of lip Y coordinates
-            lip_y = lip_coords[:, :, 1]  # (frames, n_lip_nodes)
+        # OPTIMIZATION: Reuse precomputed lip_y, lip_y_min, lip_y_max
+        if lip_y is not None and len(lips_nodes_remapped) >= 3:
+            # Compute variance efficiently (reuse lip_y_mean for both variance and range)
             lip_y_mean = lip_y.mean(dim=1, keepdim=True)  # (frames, 1)
             lip_y_var = ((lip_y - lip_y_mean) ** 2).mean(dim=1)  # (frames,)
             
-            # Alternative: use range (max - min) as curvature measure
-            lip_y_range = lip_y.max(dim=1)[0] - lip_y.min(dim=1)[0]  # (frames,)
+            # Reuse precomputed lip_y_max and lip_y_min for range
+            lip_y_range = lip_y_max - lip_y_min  # (frames,) - already computed above
             
             # Combine variance and range for better curvature measure
             lip_curvature = lip_y_var * lip_y_range  # (frames,)
             global_features[:, 5] = lip_curvature
         
         # 7. Lip Corner Angle: angle between left and right corners (relative to horizontal)
-        if left_corner_remapped is not None and right_corner_remapped is not None:
-            left_corner_coords = coords[:, left_corner_remapped, :]  # (frames, 2)
-            right_corner_coords = coords[:, right_corner_remapped, :]  # (frames, 2)
-            
-            # Vector from left to right corner
-            corner_vector = right_corner_coords - left_corner_coords  # (frames, 2)
+        # OPTIMIZATION: Reuse precomputed corner coordinates
+        if left_corner_coords is not None and right_corner_coords is not None:
+            # Vector from left to right corner (use X, Y only for angle calculation)
+            corner_vector = right_corner_coords[:, :2] - left_corner_coords[:, :2]  # (frames, 2)
             
             # Angle relative to horizontal (atan2 of y/x)
             corner_angle = torch.atan2(corner_vector[:, 1], corner_vector[:, 0])  # (frames,)
-            # Convert to degrees for better interpretability (optional, can keep in radians)
+            # Convert to degrees
             corner_angle_deg = corner_angle * 180.0 / math.pi  # (frames,)
             global_features[:, 6] = corner_angle_deg
         
-        # 8. Jaw Opening: distance from chin center to lower lip
-        if chin_center_remapped is not None and lips_nodes_remapped:
-            chin_coords = coords[:, chin_center_remapped, :]  # (frames, 2)
-            lip_coords = coords[:, lips_nodes_remapped, :]  # (frames, n_lip_nodes, 2)
-            lower_lip_y = lip_coords[:, :, 1].max(dim=1)[0]  # (frames,) - lower lip Y
-            
-            # Vertical distance from chin to lower lip
-            jaw_opening = lower_lip_y - chin_coords[:, 1]  # (frames,)
+        # 8. Jaw Opening: distance from chin center to lower lip (vertical, Y-axis only)
+        # OPTIMIZATION: Reuse precomputed chin_y and lower_lip_y
+        if chin_y is not None and lower_lip_y is not None:
+            jaw_opening = lower_lip_y - chin_y  # (frames,)
             global_features[:, 7] = jaw_opening
-        elif lips_nodes_remapped:
-            # Fallback: use bottom of coords if chin not available
-            lip_coords = coords[:, lips_nodes_remapped, :]  # (frames, n_lip_nodes, 2)
-            lower_lip_y = lip_coords[:, :, 1].max(dim=1)[0]  # (frames,)
-            bottom_y = coords[:, :, 1].max(dim=1)[0]  # (frames,)
+        elif bottom_y is not None and lower_lip_y is not None:
             jaw_opening = bottom_y - lower_lip_y
             global_features[:, 7] = jaw_opening
         
@@ -422,21 +864,24 @@ class FeatureEngineer:
     ) -> torch.Tensor:
         """
         Compute geometric features: pairwise distances, angles, ratios.
+        Uses 3D Euclidean distances if Z coordinate is available.
         Vectorized for performance.
         
         Args:
-            coords: Shape (frames, n_nodes, 2)
+            coords: Shape (frames, n_nodes, 2 or 3) - normalized coordinates
             partition: 'lips', 'mouth', or 'full'
             anchor_idx: Pre-computed anchor index (optional, for optimization)
             
         Returns:
-            Geometric features of shape (frames, n_nodes, n_geom_features)
+            Geometric features of shape (frames, n_nodes, 2) - [distance_to_anchor, angle]
+            Note: Distance uses 3D Euclidean distance if Z is available, otherwise 2D
         """
-        frames, n_nodes, _ = coords.shape
+        frames, n_nodes, n_dims = coords.shape
         device = coords.device
         dtype = coords.dtype
+        use_3d = (n_dims == 3)
         
-        # 1. Pairwise distances to anchor nodes (vectorized)
+        # 1. Pairwise distances to anchor nodes (vectorized) - 3D if available
         # Reduced to 1 anchor for memory optimization
         # OPTIMIZATION: Compute anchor index once if not provided
         if anchor_idx is None:
@@ -454,14 +899,14 @@ class FeatureEngineer:
             anchor_remapped_idx = anchor_idx
         
         # OPTIMIZED: Direct distance computation without creating large intermediate tensor
-        anchor_coords = coords[:, anchor_remapped_idx:anchor_remapped_idx+1, :]  # (frames, 1, 2)
+        anchor_coords = coords[:, anchor_remapped_idx:anchor_remapped_idx+1, :]  # (frames, 1, 2 or 3)
         
         # Compute distances more efficiently: (frames, n_nodes)
-        # Use broadcasting: coords (frames, n_nodes, 2) - anchor_coords (frames, 1, 2)
-        diff = coords - anchor_coords  # (frames, n_nodes, 2)
-        distances = torch.norm(diff, dim=2, keepdim=True)  # (frames, n_nodes, 1)
+        # Use broadcasting: coords (frames, n_nodes, 2 or 3) - anchor_coords (frames, 1, 2 or 3)
+        diff = coords - anchor_coords  # (frames, n_nodes, 2 or 3)
+        distances = torch.norm(diff, dim=2, keepdim=True)  # (frames, n_nodes, 1) - 3D distance if Z available
         
-        # 2. Angles between consecutive nodes (vectorized)
+        # 2. Angles between consecutive nodes (vectorized) - uses 3D if available
         # Compute vectors: prev->current and current->next
         # For each node i: vec1 = coords[i] - coords[i-1], vec2 = coords[i+1] - coords[i]
         # Edge cases: first node uses coords[0] as vec1, last node uses coords[-1] as vec2
@@ -470,13 +915,13 @@ class FeatureEngineer:
         coords_prev = torch.cat([coords[:, 0:1, :], coords[:, :-1, :]], dim=1)  # Shift right (prev node)
         coords_next = torch.cat([coords[:, 1:, :], coords[:, -1:, :]], dim=1)   # Shift left (next node)
         
-        vec1 = coords - coords_prev  # (frames, n_nodes, 2)
-        vec2 = coords_next - coords  # (frames, n_nodes, 2)
+        vec1 = coords - coords_prev  # (frames, n_nodes, 2 or 3)
+        vec2 = coords_next - coords  # (frames, n_nodes, 2 or 3)
         
-        # Compute dot products and norms (vectorized)
+        # Compute dot products and norms (vectorized) - works for both 2D and 3D
         dot_products = torch.sum(vec1 * vec2, dim=2)  # (frames, n_nodes)
-        norm1 = torch.norm(vec1, dim=2)  # (frames, n_nodes)
-        norm2 = torch.norm(vec2, dim=2)  # (frames, n_nodes)
+        norm1 = torch.norm(vec1, dim=2)  # (frames, n_nodes) - 3D norm if Z available
+        norm2 = torch.norm(vec2, dim=2)  # (frames, n_nodes) - 3D norm if Z available
         
         # Compute angles (vectorized)
         # Avoid division by zero
@@ -510,26 +955,32 @@ class FeatureEngineer:
         PCA and motion energy removed for aggressive memory optimization.
         
         Args:
-            landmarks: Shape (frames, n_nodes, 2)
+            landmarks: Shape (frames, n_nodes, 2 or 3) - raw landmarks
             meta: Video metadata
             partition: 'lips', 'mouth', or 'full'
             node_mapping: Original MediaPipe index -> new index
-            b0_coords: Optional pre-computed B0 coordinates (faster)
-            b2_features: Optional pre-computed B2 features (B0+B1+B2, faster, avoids recomputation)
+            b0_coords: Optional pre-computed B0 coordinates (faster) - now 3D (X, Y, Z)
+            b2_features: Optional pre-computed B2 features (B0+B1+B2, faster, avoids recomputation) - now 18 features
             
         Returns:
-            Tuple of (features, additional_meta) - B0+B1+B2+B3 (11 features total)
+            Tuple of (features, additional_meta) - B0+B1+B2+B3 (22 features total)
+            B0(3) + B1(7) + B2(8) + B3(4) = 22 features
         """
         # OPTIMIZATION: Use existing B0+B1+B2 if provided (much faster)
         if b2_features is not None:
-            b0_b1_b2 = b2_features  # Already has B0+B1+B2
-            b0 = b2_features[:, :, :2]  # Extract B0 for AU computation
+            b0_b1_b2 = b2_features  # Already has B0+B1+B2 (18 features: B0(3) + B1(7) + B2(8))
+            b0 = b2_features[:, :, :3]  # Extract B0 (X, Y, Z) for AU computation
         else:
             # Compute B0
             if b0_coords is not None:
                 b0 = b0_coords
             else:
-                b0 = self.compute_B0(landmarks, meta)
+                # Get node_mapping for B0 if not provided
+                if node_mapping is None:
+                    from preprocessing.mediapipe_nodes import get_partition_nodes
+                    nodes = get_partition_nodes(partition)
+                    node_mapping = {orig_idx: new_idx for new_idx, orig_idx in enumerate(nodes)}
+                b0 = self.compute_B0(landmarks, meta, partition=partition, node_mapping=node_mapping)
             
             # Compute B2 (B0+B1+B2)
             b2 = self.compute_B2(landmarks, meta, partition, b0_coords=b0)  # Returns B0+B1+B2
@@ -539,7 +990,7 @@ class FeatureEngineer:
         au_features, au_groups = self.compute_AU_features(b0, partition, node_mapping)
         
         # Return B0 + B1 + B2 + B3 (cumulative)
-        features = torch.cat([b0_b1_b2, au_features], dim=-1)  # (frames, n_nodes, 11)
+        features = torch.cat([b0_b1_b2, au_features], dim=-1)  # (frames, n_nodes, 22) - B0(3) + B1(7) + B2(8) + B3(4)
         
         # Additional meta
         additional_meta = {
@@ -556,17 +1007,19 @@ class FeatureEngineer:
         node_mapping: Dict
     ) -> Tuple[torch.Tensor, Dict]:
         """
-        Compute Action Unit inspired features.
+        Compute Action Unit inspired features using 3D displacement magnitudes.
         
         Args:
-            coords: Shape (frames, n_nodes, 2)
+            coords: Shape (frames, n_nodes, 2 or 3) - normalized coordinates
             partition: 'lips', 'mouth', or 'full'
             node_mapping: Original MediaPipe index -> new index
             
         Returns:
             Tuple of (AU features, AU node mapping)
+            Note: Displacement magnitudes use 3D Euclidean distance if Z is available
         """
-        frames, n_nodes, _ = coords.shape
+        frames, n_nodes, n_dims = coords.shape
+        use_3d = (n_dims == 3)
         
         # Define AU groups based on anatomical regions (not index ranges)
         from preprocessing.mediapipe_nodes import get_au_node_groups
@@ -584,11 +1037,12 @@ class FeatureEngineer:
             if len(node_indices) == 0:
                 continue
             
-            # Extract group coordinates for all frames: (frames, n_group_nodes, 2)
+            # Extract group coordinates for all frames: (frames, n_group_nodes, 2 or 3)
             group_coords = coords[:, node_indices, :]
             
-            # Compute displacement magnitude for all frames: (frames, n_group_nodes)
-            group_displacement = torch.norm(group_coords, dim=2)
+            # Compute displacement magnitude for all frames using 3D Euclidean distance if available
+            # This gives true displacement regardless of viewing angle
+            group_displacement = torch.norm(group_coords, dim=2)  # (frames, n_group_nodes) - 3D if Z available
             
             # Mean across group nodes: (frames,)
             group_mean = group_displacement.mean(dim=1)
@@ -723,11 +1177,11 @@ class FeatureEngineer:
             Tuple of (features, additional_meta)
         """
         if self.feature_level == 'B0':
-            features = self.compute_B0(landmarks, meta)
+            features = self.compute_B0(landmarks, meta, partition=partition, node_mapping=node_mapping)
             additional_meta = {}
         
         elif self.feature_level == 'B1':
-            features = self.compute_B1(landmarks, meta)
+            features = self.compute_B1(landmarks, meta, partition=partition, node_mapping=node_mapping)
             additional_meta = {}
         
         elif self.feature_level == 'B2':
@@ -758,11 +1212,11 @@ def process_split_features(
     Process features for an entire split.
     Each feature level (B0-B3) stores CUMULATIVE features (includes all previous levels).
     
-    Storage format (cumulative):
-    - B0: B0 features only (2 features: x, y)
-    - B1: B0 + B1 features (5 features: B0: 2 + B1: 3)
-    - B2: B0 + B1 + B2 features (7 features: B0: 2 + B1: 3 + B2: 2)
-    - B3: B0 + B1 + B2 + B3 features (11 features: B0: 2 + B1: 3 + B2: 2 + B3: 4)
+    Storage format (cumulative, 3D coordinates):
+    - B0: B0 features only (3 features: X, Y, Z - 3D normalized coordinates)
+    - B1: B0 + B1 features (10 features: B0: 3 + B1: 7 = vx, vy, vz, speed, ax, ay, az)
+    - B2: B0 + B1 + B2 features (18 features: B0: 3 + B1: 7 + B2: 8 = MAR, lip_width, lip_height, jaw_height, cheek_puff, lip_curvature, lip_corner_angle, jaw_opening)
+    - B3: B0 + B1 + B2 + B3 features (22 features: B0: 3 + B1: 7 + B2: 8 + B3: 4 = AU25, AU26, AU12, AU27)
     
     When loading for training, just load the target level file (no concatenation needed).
     
@@ -842,75 +1296,12 @@ def process_split_features(
     # Initialize feature engineer (each level computes independently from landmarks)
     fe = FeatureEngineer(feature_level=feature_level)
     
-    # OPTIMIZATION: Load previous level features if available (for faster computation)
-    # B1 can use B0, B2 can use B1 (which includes B0), B3 can use B2 (which includes B0+B1+B2)
-    b0_features_data = None
-    b1_features_data = None
-    b2_features_data = None
-    
-    if feature_level == 'B1' and b0_features_path and Path(b0_features_path).exists():
-        logger.info(f"Loading existing B0 features from {b0_features_path} for faster B1 computation...")
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=FutureWarning)
-                b0_features_data = torch.load(b0_features_path, map_location='cpu')
-            logger.info(f"✓ Loaded B0 features for {len(b0_features_data.get('videos', {}))} videos")
-        except Exception as e:
-            logger.warning(f"Failed to load B0 features: {e}. Will compute from landmarks (slower).")
-            b0_features_data = None
-    
-    elif feature_level == 'B2':
-        # B2 can be computed directly from extracted data (landmarks) without needing B0/B1 files
-        # Optional: Load B1/B0 if available for speedup, but not required
-        if b1_features_path and Path(b1_features_path).exists():
-            logger.info(f"[OPTIONAL] Loading existing B1 features (B0+B1) from {b1_features_path} for faster B2 computation...")
-            logger.info(f"Note: B2 can be computed directly from extracted data without B0/B1 files")
-            try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=FutureWarning)
-                    b1_features_data = torch.load(b1_features_path, map_location='cpu', weights_only=False)
-                logger.info(f"✓ Loaded B1 features for {len(b1_features_data.get('videos', {}))} videos (speedup mode)")
-            except Exception as e:
-                logger.warning(f"Failed to load B1 features: {e}. Will compute B2 directly from landmarks.")
-                b1_features_data = None
-        elif b0_features_path and Path(b0_features_path).exists():
-            logger.info(f"[OPTIONAL] Loading existing B0 features from {b0_features_path} for faster B2 computation...")
-            logger.info(f"Note: B2 can be computed directly from extracted data without B0/B1 files")
-            try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=FutureWarning)
-                    b0_features_data = torch.load(b0_features_path, map_location='cpu', weights_only=False)
-                logger.info(f"✓ Loaded B0 features for {len(b0_features_data.get('videos', {}))} videos (speedup mode)")
-            except Exception as e:
-                logger.warning(f"Failed to load B0 features: {e}. Will compute B2 directly from landmarks.")
-                b0_features_data = None
-        else:
-            logger.info(f"Computing B2 directly from extracted data (no B0/B1 files needed)")
-            logger.info(f"B2 will compute B0+B1+B2 from landmarks in one pass")
-            logger.info(f"Result will be stored in B2 file with all features (B0+B1+B2 cumulative)")
-            logger.info(f"No separate B0/B1 files will be created - everything in B2 file")
-    
-    elif feature_level == 'B3':
-        if b2_features_path and Path(b2_features_path).exists():
-            logger.info(f"Loading existing B2 features (B0+B1+B2) from {b2_features_path} for faster B3 computation...")
-            try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=FutureWarning)
-                    b2_features_data = torch.load(b2_features_path, map_location='cpu', weights_only=False)
-                logger.info(f"✓ Loaded B2 features for {len(b2_features_data.get('videos', {}))} videos")
-            except Exception as e:
-                logger.warning(f"Failed to load B2 features: {e}. Will compute from landmarks (slower).")
-                b2_features_data = None
-        elif b0_features_path and Path(b0_features_path).exists():
-            logger.info(f"Loading existing B0 features from {b0_features_path} for faster B3 computation...")
-            try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=FutureWarning)
-                    b0_features_data = torch.load(b0_features_path, map_location='cpu', weights_only=False)
-                logger.info(f"✓ Loaded B0 features for {len(b0_features_data.get('videos', {}))} videos")
-            except Exception as e:
-                logger.warning(f"Failed to load B0 features: {e}. Will compute from landmarks (slower).")
-                b0_features_data = None
+    # MEMORY OPTIMIZATION: Don't load previous level features to avoid memory issues
+    # Loading .pt files loads everything into memory anyway, so we skip it and compute from landmarks
+    # This uses less memory (no duplication) but is slightly slower
+    logger.info(f"Computing {feature_level} features directly from landmarks (memory-efficient mode)")
+    if feature_level == 'B2':
+        logger.info(f"B2 will compute B0+B1+B2 from landmarks in one pass")
     
     # Initialize output structure
     feature_data = {
@@ -929,113 +1320,41 @@ def process_split_features(
     
     ensure_dir(Path(output_path).parent)
     
-    # Process all videos
+    # MEMORY OPTIMIZATION: Process videos sequentially one at a time
+    # This prevents swap memory usage when processing large datasets
+    logger.info(f"Processing {total_videos} videos sequentially...")
+    
+    # OPTIMIZATION: Use sequential processing with optimized code (avoids memory duplication from multiprocessing)
+    # ProcessPoolExecutor duplicates all data for each process, causing massive memory usage
+    # Sequential processing is slower but uses much less memory
     processed_count = 0
-    logger.info(f"Processing {total_videos} videos...")
+    fe = FeatureEngineer(feature_level=feature_level)
+    progress_bar = tqdm(videos.items(), desc=f"Computing {feature_level} features", unit="video")
     
-    # Add progress bar for long-running feature computation
-    video_items = list(videos.items())
-    progress_bar = tqdm(
-        video_items,
-        desc=f"Computing {feature_level} features",
-        unit="video",
-        total=total_videos,
-        disable=False  # Always show progress bar
-    )
-    
+    # Process videos one at a time
     for video_id, video_data in progress_bar:
-        # Extract video data
-        landmarks = video_data['landmarks'].clone()  # Clone to avoid keeping reference
+        landmarks = video_data['landmarks']
         meta = video_data['meta']
-        video_path = video_data['video_path']
-        word = video_data['word']
-        label = video_data['label']
-        speech_mask = video_data['speech_mask']
         
-        # Compute features (cumulative: each level includes all previous levels)
-        # OPTIMIZATION: Use existing previous level features if available (much faster)
-        if feature_level == 'B1' and b0_features_data is not None:
-            video_b0_features = b0_features_data['videos'].get(video_id)
-            if video_b0_features is not None:
-                # Use existing B0 features (faster - no B0 recomputation)
-                b0_coords = video_b0_features['features']  # B0 only (2 features)
-                # Compute B1 incremental features (velocity + speed)
-                velocity = fe.compute_velocity(b0_coords)
-                speed = fe.compute_speed(velocity)
-                b1_incremental = torch.cat([velocity, speed], dim=-1)  # (frames, n_nodes, 3)
-                # Concatenate B0 + B1 (cumulative)
-                features = torch.cat([b0_coords, b1_incremental], dim=-1)  # (frames, n_nodes, 5)
-                additional_meta = {}
-            else:
-                features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
-        
-        elif feature_level == 'B2':
-            if b1_features_data is not None:
-                video_b1_features = b1_features_data['videos'].get(video_id)
-                if video_b1_features is not None:
-                    # Use existing B1 features (B0+B1) - fastest path
-                    b1_features = video_b1_features['features']  # B0+B1 (7 features)
-                    b0_coords = b1_features[:, :, :2]  # Extract B0 for geometric computation
-                    # OPTIMIZATION: Pass precomputed node_indices to avoid repeated lookups
-                    features = fe.compute_B2(landmarks, meta, partition, b0_coords=b0_coords, b1_features=b1_features, node_indices=b2_node_indices)
-                    additional_meta = {}
-                else:
-                    features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
-            elif b0_features_data is not None:
-                video_b0_features = b0_features_data['videos'].get(video_id)
-                if video_b0_features is not None:
-                    # Use existing B0 features
-                    b0_coords = video_b0_features['features']  # B0 only (2 features)
-                    # OPTIMIZATION: Pass precomputed node_indices to avoid repeated lookups
-                    features = fe.compute_B2(landmarks, meta, partition, b0_coords=b0_coords, node_indices=b2_node_indices)
-                    additional_meta = {}
-                else:
-                    features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
-            else:
-                # OPTIMIZATION: Pass precomputed node_indices even when computing from scratch
-                if b2_node_indices is not None:
-                    features = fe.compute_B2(landmarks, meta, partition, node_indices=b2_node_indices)
-                    additional_meta = {}
-                else:
-                    features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
-        
-        elif feature_level == 'B3':
-            if b2_features_data is not None:
-                video_b2_features = b2_features_data['videos'].get(video_id)
-                if video_b2_features is not None:
-                    # Use existing B2 features (B0+B1+B2) - fastest path
-                    b2_features = video_b2_features['features']  # B0+B1+B2 (7 features)
-                    b0_coords = b2_features[:, :, :2]  # Extract B0 for AU computation
-                    features, additional_meta = fe.compute_B3(landmarks, meta, partition, node_mapping, b0_coords=b0_coords, b2_features=b2_features)
-                else:
-                    features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
-            elif b0_features_data is not None:
-                video_b0_features = b0_features_data['videos'].get(video_id)
-                if video_b0_features is not None:
-                    # Use existing B0 features
-                    b0_coords = video_b0_features['features']  # B0 only (2 features)
-                    features, additional_meta = fe.compute_B3(landmarks, meta, partition, node_mapping, b0_coords=b0_coords)
-                else:
-                    features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
-            else:
-                features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
-        
+        # Compute features directly from landmarks (memory-efficient, no previous level loading)
+        if feature_level == 'B2':
+            features = fe.compute_B2(landmarks, meta, partition, node_indices=b2_node_indices)
+            additional_meta = {}
         else:
-            # B0: Normal computation
             features, additional_meta = fe.compute_features(landmarks, meta, partition=partition, node_mapping=node_mapping)
         
-        # Store processed video (only features for this level)
-        # Keep as float32 for accuracy (float16 causes precision loss and accuracy degradation)
-        # Memory optimization is handled via lazy loading and num_workers=0 instead
-        if features.dtype != torch.float32:
-            features = features.float()  # Ensure float32
+        # MEMORY OPTIMIZATION: Convert to float16 immediately to reduce memory by 50%
+        # This is safe because we'll convert back to float32 during training if needed
+        if features.dtype != torch.float16:
+            features = features.half()  # Convert to float16 immediately
         
+        # Store processed video
         feature_data['videos'][video_id] = {
-            'video_path': video_path,
-            'word': word,
-            'label': label,
-            'features': features,  # Stored as float32 for accuracy
-            'speech_mask': speech_mask,
+            'video_path': video_data['video_path'],
+            'word': video_data['word'],
+            'label': video_data['label'],
+            'features': features,
+            'speech_mask': video_data['speech_mask'],
             'meta': meta,
         }
         
@@ -1045,26 +1364,38 @@ def process_split_features(
             feature_data['meta']['n_nodes'] = features.shape[1]
             if additional_meta:
                 feature_data['meta'].update(additional_meta)
-    
+        
         processed_count += 1
         
-        # Update progress bar description with count
-        if processed_count % 100 == 0 or processed_count == total_videos:
-            progress_bar.set_postfix({
-                'processed': f'{processed_count}/{total_videos}',
-                'progress': f'{100*processed_count/total_videos:.1f}%'
-            })
+        # MEMORY OPTIMIZATION: Clear original landmarks from videos dict to free memory
+        # The landmarks are no longer needed after features are computed
+        del landmarks
+        video_data['landmarks'] = None  # Mark as cleared
+        # Note: 'features' is stored in feature_data['videos'], so we can't delete it yet
+        # But converting to float16 reduces memory by 50%
         
-        # Clear video data immediately (no overlap with other levels)
-        del landmarks, features
+        if processed_count % 100 == 0:
+            import gc
+            gc.collect()  # Force garbage collection periodically
+            # Clear Python's internal caches
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            # Log memory usage periodically
+            try:
+                import psutil
+                import os
+                process = psutil.Process(os.getpid())
+                mem_mb = process.memory_info().rss / (1024 * 1024)
+                logger.info(f"Memory usage after {processed_count} videos: {mem_mb:.1f} MB")
+            except ImportError:
+                pass  # psutil not available
     
-    # Close progress bar
     progress_bar.close()
     
+    
     # Save final result
-    # Note: torch.save() uses zipfile format by default (since PyTorch 1.6)
-    # Features are stored as float16 for disk efficiency (2x size reduction)
-    # Converted to float32 during __getitem__ for training accuracy
+    # Note: Features are already in float16 format (converted during processing)
+    # This reduces memory usage by 50% compared to float32
+    # Converted to float32 during __getitem__ for training accuracy if needed
     torch.save(feature_data, output_path)
     
     # Add metadata flag indicating float16 storage

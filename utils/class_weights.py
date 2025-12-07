@@ -19,6 +19,9 @@ def calculate_class_weights(
     Args:
         dataset: Dataset instance with video_ids and word_to_label
         method: Weight calculation method
+            - 'moderate': Moderate weighting (0.7 * balanced + 0.3 * sqrt) - adjusted for severe imbalance
+            - 'moderate_aggressive': More aggressive moderate (0.85 * balanced + 0.15 * sqrt)
+            - 'moderate_light': Lighter moderate (0.3 * balanced + 0.7 * sqrt)
             - 'balanced': sklearn-style balanced weights (n_samples / (n_classes * count))
             - 'inverse': Inverse frequency (1 / count)
             - 'sqrt': Square root of inverse frequency (1 / sqrt(count))
@@ -57,7 +60,24 @@ def calculate_class_weights(
         if count == 0:
             continue
             
-        if method == 'balanced':
+        if method == 'moderate':
+            # Moderate weighting: blend of balanced and sqrt (less aggressive than balanced, more than sqrt)
+            # Adjusted for severe imbalance: 70% balanced + 30% sqrt (more aggressive than 50/50)
+            balanced_weight = total_samples / (num_classes * count)
+            sqrt_weight = 1.0 / np.sqrt(count)
+            # Blend: 70% balanced + 30% sqrt (more aggressive for severe imbalance)
+            weights[label] = 0.7 * balanced_weight + 0.3 * sqrt_weight
+        elif method == 'moderate_aggressive':
+            # More aggressive moderate: 85% balanced + 15% sqrt
+            balanced_weight = total_samples / (num_classes * count)
+            sqrt_weight = 1.0 / np.sqrt(count)
+            weights[label] = 0.85 * balanced_weight + 0.15 * sqrt_weight
+        elif method == 'moderate_light':
+            # Lighter moderate: 30% balanced + 70% sqrt (less aggressive)
+            balanced_weight = total_samples / (num_classes * count)
+            sqrt_weight = 1.0 / np.sqrt(count)
+            weights[label] = 0.3 * balanced_weight + 0.7 * sqrt_weight
+        elif method == 'balanced':
             # sklearn-style: n_samples / (n_classes * count)
             weights[label] = total_samples / (num_classes * count)
         elif method == 'inverse':
@@ -70,7 +90,7 @@ def calculate_class_weights(
             # Logarithmic inverse frequency
             weights[label] = 1.0 / np.log(1 + count)
         else:
-            raise ValueError(f"Unknown method: {method}")
+            raise ValueError(f"Unknown method: {method}. Choose from: moderate, moderate_aggressive, moderate_light, balanced, inverse, sqrt, log")
     
     # Normalize weights to have mean=1.0 (optional, but helps with stability)
     weights = weights / weights.mean()

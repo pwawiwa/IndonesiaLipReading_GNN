@@ -12,11 +12,11 @@ import numpy as np
 
 class LipReadingDataset(Dataset):
     """Dataset for lip reading from precomputed features.
-    Each B level file contains cumulative features (no concatenation needed):
-    - B0 file: B0 features only (2 features)
-    - B1 file: B0+B1 features (5 features)
-    - B2 file: B0+B1+B2 features (7 features)
-    - B3 file: B0+B1+B2+B3 features (11 features)
+    Each B level file contains cumulative features (no concatenation needed, 3D coordinates):
+    - B0 file: B0 features only (3 features: X, Y, Z - 3D normalized coordinates)
+    - B1 file: B0+B1 features (10 features: B0: 3 + B1: 7 = vx, vy, vz, speed, ax, ay, az - all 3D)
+    - B2 file: B0+B1+B2 features (18 features: B0: 3 + B1: 7 + B2: 8 = MAR, lip_width, lip_height, jaw_height, cheek_puff, lip_curvature, lip_corner_angle, jaw_opening)
+    - B3 file: B0+B1+B2+B3 features (22 features: B0: 3 + B1: 7 + B2: 8 + B3: 4 = AU25, AU26, AU12, AU27)
     Uses lazy loading to avoid loading entire file into memory at once.
     """
     
